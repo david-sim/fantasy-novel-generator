@@ -17,6 +17,7 @@ from langgraph.graph import END, StateGraph
 from src.agents.state import NovelState
 from src.agents.nodes.world_and_creature import creature_architect, world_architect
 from src.agents.nodes.planning import character_agent, plot_agent
+from src.agents.nodes.writing import prose_stylist, red_team, scene_writer
 from src.db.models import Novel, engine
 
 logger = logging.getLogger(__name__)
@@ -33,35 +34,7 @@ MAX_REVISION_LOOPS: int = int(os.getenv("MAX_REVISION_LOOPS", "5"))
 # ---------------------------------------------------------------------------
 
 
-# character_agent and plot_agent are imported from src.agents.nodes.planning
-
-
-async def scene_writer(state: NovelState) -> dict[str, Any]:
-    """Write chapter prose from the beat outline; increment revision counter."""
-    logger.info(
-        "[scene_writer] running for novel_id=%s (revision=%s)",
-        state["novel_id"],
-        state.get("revision_count", 0),
-    )
-    # TODO: build and invoke LLM chain using state["current_outline"]
-    return {
-        "current_draft": "",
-        "revision_count": state.get("revision_count", 0) + 1,
-    }
-
-
-async def red_team(state: NovelState) -> dict[str, Any]:
-    """Critique the scene draft against lore; produce a JSON score (1-10) and notes."""
-    logger.info("[red_team] running for novel_id=%s", state["novel_id"])
-    # TODO: build and invoke critique chain; parse score and notes from JSON output
-    return {"feedback_score": 0, "feedback_notes": ""}
-
-
-async def prose_stylist(state: NovelState) -> dict[str, Any]:
-    """Apply final prose polish and voice consistency to the approved draft."""
-    logger.info("[prose_stylist] running for novel_id=%s", state["novel_id"])
-    # TODO: build and invoke LLM chain for stylistic refinement
-    return {"current_draft": state.get("current_draft", "")}
+# scene_writer, red_team, prose_stylist are imported from src.agents.nodes.writing
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +192,7 @@ async def execute_graph(
         "feedback_score":  0,
         "feedback_notes":  "",
         "revision_count":  0,
+        "chapter_id":      0,
     }
 
     logger.info(

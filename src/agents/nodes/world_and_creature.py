@@ -51,6 +51,9 @@ def _build_llm() -> BaseChatModel:
     LLM_MODEL       — model name (e.g. "gpt-4o")
     LLM_TEMPERATURE — float, default 0.85
     """
+    from dotenv import load_dotenv
+    load_dotenv()  # no-op if already loaded; ensures .env is read in non-UI entry points
+
     provider = os.getenv("LLM_PROVIDER", "openai").lower()
     model = os.getenv("LLM_MODEL", "gpt-4o")
     temperature = float(os.getenv("LLM_TEMPERATURE", "0.85"))

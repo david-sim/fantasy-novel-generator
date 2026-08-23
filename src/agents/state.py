@@ -45,6 +45,10 @@ class NovelState(TypedDict):
     revision_count:
         Number of Scene Writer → Red Team loops completed for the current
         chapter.  Useful for imposing a maximum revision cap.
+    chapter_id:
+        Primary key of the Chapter row currently being written.  Set to 0
+        until the Scene Writer creates the first draft.  Carried forward
+        so Red Team and Prose Stylist can update the correct row.
     """
 
     novel_id: int
@@ -56,3 +60,4 @@ class NovelState(TypedDict):
     feedback_score: int
     feedback_notes: str
     revision_count: int
+    chapter_id: int

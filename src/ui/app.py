@@ -18,11 +18,17 @@ import threading
 from datetime import datetime
 from typing import Any, Optional
 
+from dotenv import load_dotenv
+
+# Load .env before any src.* module is imported so that os.getenv() calls
+# inside LangChain / SQLAlchemy constructors see the correct values.
+load_dotenv()
+
 import streamlit as st
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from src.db.models import AgentLog, Novel, engine
+from src.db.models import AgentLog, Chapter, Character, Creature, Novel, engine
 from src.db.init_db import init_db
 from src.ui.utils import ThreadStatus, get_thread_status, launch_novel_graph
 
@@ -124,6 +130,94 @@ def _fetch_recent_novels(limit: int = 20) -> list[dict[str, Any]]:
             {"id": row.id, "title": row.title, "genre": row.genre}
             for row in rows
         ]
+
+
+def _fetch_creatures(novel_id: int) -> list[dict[str, Any]]:
+    """Return Creature rows for *novel_id* as plain dicts."""
+    with Session(engine) as session:
+        stmt = (
+            select(Creature)
+            .where(Creature.novel_id == novel_id)
+            .order_by(Creature.name)
+        )
+        rows = session.scalars(stmt).all()
+        return [
+            {
+                "id":               row.id,
+                "name":             row.name,
+                "species_type":     row.species_type or "",
+                "ecology":          row.ecology or "",
+                "magical_traits":   row.magical_traits or "",
+                "lore_description": row.lore_description or "",
+            }
+            for row in rows
+        ]
+
+
+def _fetch_characters(novel_id: int) -> list[dict[str, Any]]:
+    """Return Character rows for *novel_id* as plain dicts."""
+    with Session(engine) as session:
+        stmt = (
+            select(Character)
+            .where(Character.novel_id == novel_id)
+            .order_by(Character.name)
+        )
+        rows = session.scalars(stmt).all()
+        return [
+            {
+                "id":          row.id,
+                "name":        row.name,
+                "role":        row.role or "",
+                "backstory":   row.backstory or "",
+                "personality": row.personality or "",
+                "abilities":   row.abilities or "",
+                "arc_summary": row.arc_summary or "",
+            }
+            for row in rows
+        ]
+
+
+def _fetch_chapters(novel_id: int) -> list[dict[str, Any]]:
+    """Return Chapter rows for *novel_id* ordered by chapter_number, as plain dicts."""
+    with Session(engine) as session:
+        stmt = (
+            select(Chapter)
+            .where(Chapter.novel_id == novel_id)
+            .order_by(Chapter.chapter_number)
+        )
+        rows = session.scalars(stmt).all()
+        return [
+            {
+                "id":             row.id,
+                "chapter_number": row.chapter_number,
+                "title":          row.title or "",
+                "beat_outline":   row.beat_outline or "",
+                "content":        row.content or "",
+                "red_team_score": row.red_team_score,   # int | None
+                "red_team_notes": row.red_team_notes or "",
+            }
+            for row in rows
+        ]
+
+
+def _fetch_world_lore(novel_id: int, k: int = 50) -> list[dict[str, Any]]:
+    """
+    Query ChromaDB for world-lore documents attached to *novel_id*.
+
+    Returns an empty list on any error so the UI degrades gracefully when
+    ChromaDB is unavailable or the collection is empty.
+    """
+    try:
+        from src.db.vector_store import COLLECTION_WORLD_LORE, search_lore  # lazy import
+
+        return search_lore(
+            COLLECTION_WORLD_LORE,
+            "geography kingdoms magic systems history world overview",
+            k=k,
+            where={"novel_id": novel_id},
+        )
+    except Exception:
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +524,208 @@ def _render_live_monitor() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tab: Bestiary & Lore
+# ---------------------------------------------------------------------------
+
+
+def _render_bestiary() -> None:
+    """
+    Bestiary & Lore tab — Story 4.3.
+
+    Sections
+    --------
+    1. Creatures  — SQLite Creature rows as an expandable card grid (3 columns).
+    2. Characters — SQLite Character rows as expandable dual-column cards.
+    3. World Lore — ChromaDB world_lore documents grouped by metadata ``type``.
+    """
+    novel_id: Optional[int] = st.session_state.get("novel_id")
+
+    if novel_id is None:
+        st.info("No novel selected. Use the sidebar to start or load a generation.")
+        return
+
+    creatures  = _fetch_creatures(novel_id)
+    characters = _fetch_characters(novel_id)
+    world_lore = _fetch_world_lore(novel_id)
+
+    # ── Creatures ─────────────────────────────────────────────────────────────
+    st.subheader(f"🐉 Creatures  ({len(creatures)})")
+    if not creatures:
+        st.info("No creatures generated yet — the Creature Architect has not run.")
+    else:
+        num_cols = min(3, len(creatures))
+        cols = st.columns(num_cols)
+        for i, c in enumerate(creatures):
+            with cols[i % num_cols]:
+                species_badge = f"  `{c['species_type']}`" if c["species_type"] else ""
+                with st.expander(f"**{c['name']}**{species_badge}", expanded=False):
+                    if c["ecology"]:
+                        st.markdown("**🌿 Ecology**")
+                        st.write(c["ecology"])
+                    if c["magical_traits"]:
+                        st.markdown("**✨ Magical Traits**")
+                        st.write(c["magical_traits"])
+                    if c["lore_description"]:
+                        st.markdown("**📜 Lore**")
+                        st.write(c["lore_description"])
+
+    st.divider()
+
+    # ── Characters ────────────────────────────────────────────────────────────
+    st.subheader(f"🧙 Characters  ({len(characters)})")
+    if not characters:
+        st.info("No characters generated yet — the Character Agent has not run.")
+    else:
+        for char in characters:
+            role_badge = f"  `{char['role']}`" if char["role"] else ""
+            with st.expander(f"**{char['name']}**{role_badge}", expanded=False):
+                left, right = st.columns(2)
+                with left:
+                    if char["backstory"]:
+                        st.markdown("**📖 Backstory**")
+                        st.write(char["backstory"])
+                    if char["personality"]:
+                        st.markdown("**🎭 Personality**")
+                        st.write(char["personality"])
+                with right:
+                    if char["abilities"]:
+                        st.markdown("**⚔️ Abilities**")
+                        st.write(char["abilities"])
+                    if char["arc_summary"]:
+                        st.markdown("**🌀 Character Arc**")
+                        st.write(char["arc_summary"])
+
+    st.divider()
+
+    # ── World Lore (ChromaDB) ─────────────────────────────────────────────────
+    st.subheader("🌍 World Lore")
+    if not world_lore:
+        st.info(
+            "No world lore in the vector store yet — "
+            "the World Architect agent populates this section."
+        )
+    else:
+        # Group documents by their metadata 'type' field so the reader can
+        # navigate by category (kingdom, magic_rule, history, world_overview, …)
+        lore_by_type: dict[str, list[dict[str, Any]]] = {}
+        for doc in world_lore:
+            doc_type = (doc.get("metadata") or {}).get("type", "general")
+            lore_by_type.setdefault(doc_type, []).append(doc)
+
+        _LORE_ICON: dict[str, str] = {
+            "kingdom":        "🏰",
+            "magic_rule":     "⚗️",
+            "history":        "📜",
+            "world_overview": "🌐",
+            "general":        "📄",
+        }
+        for lore_type, docs in sorted(lore_by_type.items()):
+            icon = _LORE_ICON.get(lore_type, "📄")
+            type_label = lore_type.replace("_", " ").title()
+            count_label = "entry" if len(docs) == 1 else "entries"
+            with st.expander(
+                f"{icon} **{type_label}** ({len(docs)} {count_label})",
+                expanded=lore_type in ("world_overview", "kingdom"),
+            ):
+                for j, doc in enumerate(docs):
+                    doc_name = (doc.get("metadata") or {}).get("name", f"Entry {j + 1}")
+                    st.markdown(f"##### {doc_name}")
+                    st.write(doc.get("text", ""))
+                    if j < len(docs) - 1:
+                        st.divider()
+
+
+# ---------------------------------------------------------------------------
+# Tab: Manuscript Reader
+# ---------------------------------------------------------------------------
+
+
+def _render_manuscript() -> None:
+    """
+    Manuscript Reader tab — Story 4.4.
+
+    For each Chapter row (ordered by chapter_number):
+    - Header: chapter title + colour-coded Red Team score badge.
+    - Left column (3/4): polished prose rendered as Markdown.
+      Falls back to beat outline when Scene Writer has not yet run.
+    - Right column (1/4): numeric score gauge + progress bar + critique notes.
+    """
+    novel_id: Optional[int] = st.session_state.get("novel_id")
+
+    if novel_id is None:
+        st.info("No novel selected. Use the sidebar to start or load a generation.")
+        return
+
+    chapters = _fetch_chapters(novel_id)
+
+    if not chapters:
+        st.info(
+            "No chapters generated yet. "
+            "Complete the full pipeline (World → Creature → Character → Plot → Scene) "
+            "to produce manuscript content."
+        )
+        return
+
+    for ch in chapters:
+        score: Optional[int] = ch["red_team_score"]
+
+        # Colour-coded score badge
+        if score is None:
+            badge_bg, badge_label = "#9E9E9E", "No score"
+        elif score >= 8:
+            badge_bg, badge_label = "#43A047", f"✅ {score}/10"
+        elif score >= 5:
+            badge_bg, badge_label = "#FB8C00", f"⚠️ {score}/10"
+        else:
+            badge_bg, badge_label = "#E53935", f"❌ {score}/10"
+
+        chapter_heading = f"Chapter {ch['chapter_number']}"
+        if ch["title"]:
+            chapter_heading += f": {ch['title']}"
+
+        st.markdown(
+            f"### {chapter_heading}"
+            f"&ensp;<span style=\""
+            f"background:{badge_bg};color:#fff;"
+            f"padding:2px 12px;border-radius:12px;"
+            f"font-size:0.8rem;vertical-align:middle;\""
+            f">{badge_label}</span>",
+            unsafe_allow_html=True,
+        )
+
+        prose_col, notes_col = st.columns([3, 1])
+
+        with prose_col:
+            st.caption("📝 Manuscript")
+            if ch["content"]:
+                st.markdown(ch["content"])
+            elif ch["beat_outline"]:
+                st.caption("*(Scene Writer has not run — showing beat outline only)*")
+                st.markdown(ch["beat_outline"])
+            else:
+                st.caption("*No content yet.*")
+
+        with notes_col:
+            st.caption("🔴 Red Team")
+            if score is not None:
+                st.markdown(
+                    f'<div style="text-align:center;padding:8px 0 4px;">'
+                    f'<span style="font-size:2.8rem;font-weight:800;color:{badge_bg};">'
+                    f"{score}</span>"
+                    f'<span style="font-size:1rem;color:#90A4AE;">/10</span>'
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                st.progress(score / 10)
+            if ch["red_team_notes"]:
+                st.write(ch["red_team_notes"])
+            else:
+                st.caption("*No critique notes.*")
+
+        st.divider()
+
+
+# ---------------------------------------------------------------------------
 # Main layout
 # ---------------------------------------------------------------------------
 
@@ -443,11 +739,7 @@ with tab_monitor:
     _render_live_monitor()
 
 with tab_bestiary:
-    st.subheader("🐉 Bestiary & Lore")
-    st.info("Coming in Story 4.3 — Browse generated creatures, characters, and world rules.")
+    _render_bestiary()
 
 with tab_manuscript:
-    st.subheader("📜 Manuscript Reader")
-    st.info(
-        "Coming in Story 4.4 — Read generated chapters alongside Red Team critique notes."
-    )
+    _render_manuscript()
