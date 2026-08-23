@@ -1,0 +1,90 @@
+name: Build → ECR → ECS Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+# ---------------------------------------------------------------------------
+# Workflow-level env vars — keep in sync with Terraform outputs.
+# ECS_CLUSTER / ECS_SERVICE match the names produced by local.name_prefix in
+# infra/main.tf when var.environment = "prod" (the default).
+# ---------------------------------------------------------------------------
+env:
+  AWS_REGION:     us-east-1
+  ECR_REPOSITORY: novelengine            # matches var.ecr_repository_name in Terraform
+  ECS_CLUSTER:    novelengine-prod-cluster
+  ECS_SERVICE:    novelengine-prod-service
+
+jobs:
+  deploy:
+    name: Build, push, and deploy to ECS Fargate
+    runs-on: ubuntu-latest
+
+    # OIDC token + code read – minimum required permissions
+    permissions:
+      id-token: write   # allows GitHub to issue an OIDC JWT for AWS
+      contents: read
+
+    steps:
+      # ── 1. Source ─────────────────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── 2. AWS auth via OIDC (no long-lived access keys stored in secrets) ─
+      #        AWS_ROLE_ARN = Terraform output "github_actions_role_arn"
+      #        Set it once in: GitHub → Settings → Secrets → Actions
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: github-novelengine-${{ github.run_id }}
+          aws-region:        ${{ env.AWS_REGION }}
+
+      # ── 3. ECR login ──────────────────────────────────────────────────────
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ── 4. Build & push (with layer cache stored in GitHub Actions cache) ─
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        id: build-push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          # Tag with both commit SHA (immutable) and latest (mutable convenience alias)
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      # ── 5. ECS rolling deployment ─────────────────────────────────────────
+      # The ECS service is configured to pull :latest on every new deployment.
+      # force-new-deployment stops the old tasks and starts fresh ones.
+      - name: Force new ECS deployment
+        run: |
+          aws ecs update-service \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --service "${{ env.ECS_SERVICE }}" \
+            --force-new-deployment \
+            --region  "${{ env.AWS_REGION }}"
+
+      # Wait up to 10 min for all new tasks to pass health checks
+      - name: Wait for deployment to stabilize
+        run: |
+          aws ecs wait services-stable \
+            --cluster  "${{ env.ECS_CLUSTER }}" \
+            --services "${{ env.ECS_SERVICE }}" \
+            --region   "${{ env.AWS_REGION }}"
+
+      # ── 6. Summary ────────────────────────────────────────────────────────
+      - name: Print deployed image digest
+        run: |
+          echo "### Deployed image" >> $GITHUB_STEP_SUMMARY
+          echo "\`${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "Digest: ${{ steps.build-push.outputs.digest }}" >> $GITHUB_STEP_SUMMARY

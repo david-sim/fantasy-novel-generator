@@ -1,0 +1,37 @@
+# =============================================================================
+# infra/terraform.tfvars.example
+# Copy this file to terraform.tfvars (git-ignored) and fill in real values.
+# NEVER commit terraform.tfvars – it contains secrets.
+# =============================================================================
+
+# ── Required (no defaults) ────────────────────────────────────────────────────
+
+# GitHub repository in "owner/repo" format – scopes the OIDC trust policy
+github_repo = "myorg/fantansy-novel-generator"
+
+# API key for your LLM provider (value stored in SSM SecureString)
+llm_api_key = "sk-..."
+
+# RDS master password (min 8 chars)
+db_password = "change-me-at-least-8-chars"
+
+# ── Optional overrides ────────────────────────────────────────────────────────
+
+aws_region          = "us-east-1"
+environment         = "prod"
+ecr_repository_name = "novelengine"
+
+# LLM settings
+llm_provider    = "openai"   # openai | anthropic | google
+llm_model       = "gpt-4o"
+llm_temperature = "0.85"
+max_revision_loops = 5
+
+# ECS Fargate sizing (512 CPU / 1024 MB is the minimum sensible for this app)
+task_cpu      = 512
+task_memory   = 1024
+desired_count = 1
+
+# RDS
+db_username       = "novelengine"
+db_instance_class = "db.t3.micro"
