@@ -93,6 +93,7 @@ class Chapter(Base):
     title: Mapped[Optional[str]] = mapped_column(String(255))
     beat_outline: Mapped[Optional[str]] = mapped_column(Text)    # plot beat notes
     content: Mapped[Optional[str]] = mapped_column(Text)         # generated markdown prose
+    summary: Mapped[Optional[str]] = mapped_column(Text)         # short recap for continuity
     red_team_score: Mapped[Optional[int]] = mapped_column(Integer)  # 1-10 critique score
     red_team_notes: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(

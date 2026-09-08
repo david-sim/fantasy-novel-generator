@@ -47,9 +47,12 @@ def _build_llm() -> BaseChatModel:
     """
     Instantiate the chat model from environment variables.
 
-    LLM_PROVIDER    — "openai" (default) | "anthropic" | "google"
-    LLM_MODEL       — model name (e.g. "gpt-4o")
-    LLM_TEMPERATURE — float, default 0.85
+    LLM_PROVIDER            — "openai" (default) | "anthropic" | "google"
+    LLM_MODEL               — model name (e.g. "gpt-4o")
+    LLM_TEMPERATURE         — float, default 0.85
+    LLM_MAX_TOKENS_STRUCTURED — int, default 4096. Caps structured-JSON output
+                              (world/creature/character/plot) so a verbose
+                              completion can't silently burn excess tokens.
     """
     from dotenv import load_dotenv
     load_dotenv()  # no-op if already loaded; ensures .env is read in non-UI entry points
@@ -57,21 +60,22 @@ def _build_llm() -> BaseChatModel:
     provider = os.getenv("LLM_PROVIDER", "openai").lower()
     model = os.getenv("LLM_MODEL", "gpt-4o")
     temperature = float(os.getenv("LLM_TEMPERATURE", "0.85"))
+    max_tokens = int(os.getenv("LLM_MAX_TOKENS_STRUCTURED", "4096"))
 
     if provider == "openai":
         from langchain_openai import ChatOpenAI  # type: ignore[import]
 
-        return ChatOpenAI(model=model, temperature=temperature)
+        return ChatOpenAI(model=model, temperature=temperature, max_tokens=max_tokens)
 
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic  # type: ignore[import]
 
-        return ChatAnthropic(model=model, temperature=temperature)  # type: ignore[call-arg]
+        return ChatAnthropic(model=model, temperature=temperature, max_tokens=max_tokens)  # type: ignore[call-arg]
 
     if provider == "google":
         from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore[import]
 
-        return ChatGoogleGenerativeAI(model=model, temperature=temperature)
+        return ChatGoogleGenerativeAI(model=model, temperature=temperature, max_output_tokens=max_tokens)
 
     raise ValueError(
         f"Unsupported LLM_PROVIDER '{provider}'. Choose from: openai, anthropic, google."

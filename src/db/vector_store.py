@@ -149,6 +149,7 @@ def search_lore(
     query: str,
     k: int = 3,
     where: dict[str, Any] | None = None,
+    max_chars: int | None = None,
 ) -> list[dict[str, Any]]:
     """
     Return the *k* most semantically similar lore documents.
@@ -165,6 +166,13 @@ def search_lore(
     where:
         Optional ChromaDB metadata filter applied before ranking, e.g.
         ``{"novel_id": 1}`` or ``{"$and": [{"novel_id": 1}, {"type": "creature"}]}``.
+    max_chars:
+        Token-efficiency guard.  When set, each returned ``text`` is hard-capped
+        at this many characters (with a ``"… [truncated]"`` suffix when cut).
+        Leave ``None`` (default) to return full document text unchanged — used
+        by UI read paths that display lore to a human.  Agent nodes building
+        LLM prompts should pass an explicit cap (e.g. 800) to bound worst-case
+        prompt size regardless of how verbose a stored document is.
 
     Returns
     -------
@@ -205,6 +213,12 @@ def search_lore(
     documents: list[str]            = (raw.get("documents") or [[]])[0]
     metadatas: list[dict[str, Any]] = (raw.get("metadatas") or [[]])[0]
     distances: list[float]          = (raw.get("distances") or [[]])[0]
+
+    if max_chars is not None:
+        documents = [
+            doc if len(doc) <= max_chars else doc[:max_chars].rstrip() + "… [truncated]"
+            for doc in documents
+        ]
 
     results = [
         {

@@ -30,7 +30,13 @@ from sqlalchemy.orm import Session
 
 from src.db.models import AgentLog, Chapter, Character, Creature, Novel, engine
 from src.db.init_db import init_db
-from src.ui.utils import ThreadStatus, get_thread_status, launch_novel_graph
+from src.agents.graph import get_novel_progress
+from src.ui.utils import (
+    ThreadStatus,
+    get_thread_status,
+    launch_next_chapter,
+    launch_novel_graph,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -427,6 +433,57 @@ def _render_live_monitor() -> None:
         st.info("No novel selected. Use the sidebar to start or load a generation.")
         return
 
+    # --- Chapter control ----------------------------------------------------
+    # Chapter-by-chapter generation: the initial run (sidebar "Start
+    # Generation") always stops after Chapter 1. Every subsequent chapter is
+    # produced one at a time from this button, which skips World/Creature/
+    # Character generation entirely (see execute_next_chapter).
+    progress = get_novel_progress(novel_id)
+    cc1, cc2 = st.columns([3, 1])
+    if not progress.setup_complete:
+        cc1.warning(
+            "📖 World, creatures, and characters haven't been generated yet "
+            "for this novel — likely because a previous run was interrupted "
+            "before finishing setup."
+        )
+        if is_running:
+            cc2.button(
+                "⏳ Generating…",
+                disabled=True,
+                use_container_width=True,
+                key="resume_setup_btn_running",
+            )
+        else:
+            if cc2.button(
+                "▶️ Generate Chapter 1",
+                use_container_width=True,
+                key="resume_setup_btn",
+            ):
+                thread = launch_novel_graph(novel_id=novel_id, initial_prompt="")
+                st.session_state["graph_thread"] = thread
+                st.rerun()
+    else:
+        cc1.markdown(
+            f"📚 **{progress.chapter_count}** chapter"
+            f"{'s' if progress.chapter_count != 1 else ''} written so far."
+        )
+        if is_running:
+            cc2.button(
+                f"⏳ Writing Chapter {progress.next_chapter_number}…",
+                disabled=True,
+                use_container_width=True,
+            )
+        else:
+            if cc2.button(
+                f"▶️ Generate Chapter {progress.next_chapter_number}",
+                use_container_width=True,
+                key="generate_next_chapter_btn",
+            ):
+                thread = launch_next_chapter(novel_id=novel_id)
+                st.session_state["graph_thread"] = thread
+                st.rerun()
+    st.divider()
+
     logs = _fetch_logs(novel_id)
 
     # --- Summary metrics strip --------------------------------------------
@@ -644,7 +701,13 @@ def _render_manuscript() -> None:
     """
     Manuscript Reader tab — Story 4.4.
 
-    For each Chapter row (ordered by chapter_number):
+    Renders one Chapter at a time (paginated) rather than the whole
+    manuscript in a single scroll, so that:
+    - Novels with many chapters stay fast to render (no giant DOM / text blob).
+    - Every chapter remains individually reachable via Previous/Next
+      buttons or the "jump to chapter" selector.
+
+    For the selected Chapter row:
     - Header: chapter title + colour-coded Red Team score badge.
     - Left column (3/4): polished prose rendered as Markdown.
       Falls back to beat outline when Scene Writer has not yet run.
@@ -666,63 +729,134 @@ def _render_manuscript() -> None:
         )
         return
 
-    for ch in chapters:
-        score: Optional[int] = ch["red_team_score"]
+    total = len(chapters)
 
-        # Colour-coded score badge
-        if score is None:
-            badge_bg, badge_label = "#9E9E9E", "No score"
-        elif score >= 8:
-            badge_bg, badge_label = "#43A047", f"✅ {score}/10"
-        elif score >= 5:
-            badge_bg, badge_label = "#FB8C00", f"⚠️ {score}/10"
-        else:
-            badge_bg, badge_label = "#E53935", f"❌ {score}/10"
+    # --- Pagination state -------------------------------------------------
+    # ``page_key`` is the single logical "current chapter index". The
+    # selectbox is bound to its own widget key and kept in sync via
+    # on_change/on_click callbacks — callbacks are the only reliable way to
+    # change a widget's displayed value in Streamlit; mutating
+    # st.session_state directly in the script body (then calling st.rerun())
+    # does NOT reliably update an already-instantiated widget with the same
+    # key, which is why Previous/Next previously appeared to do nothing.
+    page_key = f"manuscript_chapter_idx_{novel_id}"
+    select_key = f"{page_key}_select"
+    if (
+        page_key not in st.session_state
+        or select_key not in st.session_state
+        or st.session_state[page_key] >= total
+    ):
+        st.session_state[page_key] = total - 1  # default: most recently written chapter
+        st.session_state[select_key] = st.session_state[page_key]
 
-        chapter_heading = f"Chapter {ch['chapter_number']}"
-        if ch["title"]:
-            chapter_heading += f": {ch['title']}"
+    def _chapter_label(i: int) -> str:
+        c = chapters[i]
+        label = f"Chapter {c['chapter_number']}"
+        if c["title"]:
+            label += f": {c['title']}"
+        return label
 
-        st.markdown(
-            f"### {chapter_heading}"
-            f"&ensp;<span style=\""
-            f"background:{badge_bg};color:#fff;"
-            f"padding:2px 12px;border-radius:12px;"
-            f"font-size:0.8rem;vertical-align:middle;\""
-            f">{badge_label}</span>",
-            unsafe_allow_html=True,
+    def _go_prev() -> None:
+        new_idx = max(0, st.session_state[page_key] - 1)
+        st.session_state[page_key] = new_idx
+        st.session_state[select_key] = new_idx
+
+    def _go_next() -> None:
+        new_idx = min(total - 1, st.session_state[page_key] + 1)
+        st.session_state[page_key] = new_idx
+        st.session_state[select_key] = new_idx
+
+    def _on_select_change() -> None:
+        st.session_state[page_key] = st.session_state[select_key]
+
+    nav_prev, nav_select, nav_next = st.columns([1, 4, 1])
+
+    with nav_prev:
+        st.button(
+            "⬅ Previous",
+            use_container_width=True,
+            disabled=st.session_state[page_key] == 0,
+            key=f"manuscript_prev_{novel_id}",
+            on_click=_go_prev,
         )
 
-        prose_col, notes_col = st.columns([3, 1])
+    with nav_next:
+        st.button(
+            "Next ➡",
+            use_container_width=True,
+            disabled=st.session_state[page_key] == total - 1,
+            key=f"manuscript_next_{novel_id}",
+            on_click=_go_next,
+        )
 
-        with prose_col:
-            st.caption("📝 Manuscript")
-            if ch["content"]:
-                st.markdown(ch["content"])
-            elif ch["beat_outline"]:
-                st.caption("*(Scene Writer has not run — showing beat outline only)*")
-                st.markdown(ch["beat_outline"])
-            else:
-                st.caption("*No content yet.*")
+    with nav_select:
+        st.selectbox(
+            "Jump to chapter",
+            options=list(range(total)),
+            format_func=_chapter_label,
+            key=select_key,
+            on_change=_on_select_change,
+            label_visibility="collapsed",
+        )
 
-        with notes_col:
-            st.caption("🔴 Red Team")
-            if score is not None:
-                st.markdown(
-                    f'<div style="text-align:center;padding:8px 0 4px;">'
-                    f'<span style="font-size:2.8rem;font-weight:800;color:{badge_bg};">'
-                    f"{score}</span>"
-                    f'<span style="font-size:1rem;color:#90A4AE;">/10</span>'
-                    f"</div>",
-                    unsafe_allow_html=True,
-                )
-                st.progress(score / 10)
-            if ch["red_team_notes"]:
-                st.write(ch["red_team_notes"])
-            else:
-                st.caption("*No critique notes.*")
+    st.caption(f"Chapter {st.session_state[page_key] + 1} of {total}")
+    st.divider()
 
-        st.divider()
+    ch = chapters[st.session_state[page_key]]
+    score: Optional[int] = ch["red_team_score"]
+
+    # Colour-coded score badge
+    if score is None:
+        badge_bg, badge_label = "#9E9E9E", "No score"
+    elif score >= 8:
+        badge_bg, badge_label = "#43A047", f"✅ {score}/10"
+    elif score >= 5:
+        badge_bg, badge_label = "#FB8C00", f"⚠️ {score}/10"
+    else:
+        badge_bg, badge_label = "#E53935", f"❌ {score}/10"
+
+    chapter_heading = f"Chapter {ch['chapter_number']}"
+    if ch["title"]:
+        chapter_heading += f": {ch['title']}"
+
+    st.markdown(
+        f"### {chapter_heading}"
+        f"&ensp;<span style=\""
+        f"background:{badge_bg};color:#fff;"
+        f"padding:2px 12px;border-radius:12px;"
+        f"font-size:0.8rem;vertical-align:middle;\""
+        f">{badge_label}</span>",
+        unsafe_allow_html=True,
+    )
+
+    prose_col, notes_col = st.columns([3, 1])
+
+    with prose_col:
+        st.caption("📝 Manuscript")
+        if ch["content"]:
+            st.markdown(ch["content"])
+        elif ch["beat_outline"]:
+            st.caption("*(Scene Writer has not run — showing beat outline only)*")
+            st.markdown(ch["beat_outline"])
+        else:
+            st.caption("*No content yet.*")
+
+    with notes_col:
+        st.caption("🔴 Red Team")
+        if score is not None:
+            st.markdown(
+                f'<div style="text-align:center;padding:8px 0 4px;">'
+                f'<span style="font-size:2.8rem;font-weight:800;color:{badge_bg};">'
+                f"{score}</span>"
+                f'<span style="font-size:1rem;color:#90A4AE;">/10</span>'
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            st.progress(score / 10)
+        if ch["red_team_notes"]:
+            st.write(ch["red_team_notes"])
+        else:
+            st.caption("*No critique notes.*")
 
 
 # ---------------------------------------------------------------------------

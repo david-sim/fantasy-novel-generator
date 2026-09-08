@@ -64,44 +64,57 @@ logger = logging.getLogger(__name__)
 
 @lru_cache(maxsize=1)
 def _build_creative_llm() -> BaseChatModel:
-    """High-temperature model for prose generation and stylistic polishing."""
+    """
+    High-temperature model for prose generation and stylistic polishing.
+
+    LLM_MAX_TOKENS_PROSE — int, default 8192. Chapters run up to ~6,000 words
+    (≈8k tokens); the cap prevents an unbounded/runaway completion while
+    still comfortably covering the Scene Writer's target length.
+    """
     from dotenv import load_dotenv
     load_dotenv()
 
     provider    = os.getenv("LLM_PROVIDER", "openai").lower()
     model       = os.getenv("LLM_MODEL", "gpt-4o")
     temperature = float(os.getenv("LLM_TEMPERATURE", "0.9"))
+    max_tokens  = int(os.getenv("LLM_MAX_TOKENS_PROSE", "8192"))
 
     if provider == "openai":
         from langchain_openai import ChatOpenAI  # type: ignore[import]
-        return ChatOpenAI(model=model, temperature=temperature)
+        return ChatOpenAI(model=model, temperature=temperature, max_tokens=max_tokens)
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic  # type: ignore[import]
-        return ChatAnthropic(model=model, temperature=temperature)  # type: ignore[call-arg]
+        return ChatAnthropic(model=model, temperature=temperature, max_tokens=max_tokens)  # type: ignore[call-arg]
     if provider == "google":
         from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore[import]
-        return ChatGoogleGenerativeAI(model=model, temperature=temperature)
+        return ChatGoogleGenerativeAI(model=model, temperature=temperature, max_output_tokens=max_tokens)
     raise ValueError(f"Unsupported LLM_PROVIDER '{provider}'.")
 
 
 @lru_cache(maxsize=1)
 def _build_critique_llm() -> BaseChatModel:
-    """Low-temperature model for analytical audit tasks (fixed at 0.25)."""
+    """
+    Low-temperature model for analytical audit tasks (fixed at 0.25).
+
+    LLM_MAX_TOKENS_CRITIQUE — int, default 2048. A structured critique is
+    a few short fields, not prose — capping tightly avoids wasted tokens.
+    """
     from dotenv import load_dotenv
     load_dotenv()
 
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
-    model    = os.getenv("LLM_MODEL", "gpt-4o")
+    provider   = os.getenv("LLM_PROVIDER", "openai").lower()
+    model      = os.getenv("LLM_MODEL", "gpt-4o")
+    max_tokens = int(os.getenv("LLM_MAX_TOKENS_CRITIQUE", "2048"))
 
     if provider == "openai":
         from langchain_openai import ChatOpenAI  # type: ignore[import]
-        return ChatOpenAI(model=model, temperature=0.25)
+        return ChatOpenAI(model=model, temperature=0.25, max_tokens=max_tokens)
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic  # type: ignore[import]
-        return ChatAnthropic(model=model, temperature=0.25)  # type: ignore[call-arg]
+        return ChatAnthropic(model=model, temperature=0.25, max_tokens=max_tokens)  # type: ignore[call-arg]
     if provider == "google":
         from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore[import]
-        return ChatGoogleGenerativeAI(model=model, temperature=0.25)
+        return ChatGoogleGenerativeAI(model=model, temperature=0.25, max_output_tokens=max_tokens)
     raise ValueError(f"Unsupported LLM_PROVIDER '{provider}'.")
 
 
@@ -242,19 +255,30 @@ def _fetch_writing_context(novel_id: int) -> str:
     Query ChromaDB for world, character, and creature lore associated with
     *novel_id*.  Returns a single formatted string for prompt injection.
     Errors are silenced so the pipeline does not abort on a cold vector store.
+
+    Token efficiency: ``k`` is capped to the minimum breadth needed for lore
+    consistency, and every retrieved document is hard-truncated via
+    ``max_chars`` so a single verbose lore entry can't blow up prompt size —
+    this function is called on every Scene Writer revision pass and every
+    Red Team audit, so its cost compounds across a chapter's revision loop.
     """
     sections: list[str] = []
 
-    def _safe_search(collection: str, query: str, k: int) -> list[dict[str, Any]]:
+    def _safe_search(
+        collection: str, query: str, k: int, max_chars: int
+    ) -> list[dict[str, Any]]:
         try:
-            return search_lore(collection, query, k=k, where={"novel_id": novel_id})
+            return search_lore(
+                collection, query, k=k, where={"novel_id": novel_id}, max_chars=max_chars
+            )
         except Exception:
             return []
 
     world_hits = _safe_search(
         COLLECTION_WORLD_LORE,
         "geography kingdoms magic systems history cosmology",
-        k=8,
+        k=6,
+        max_chars=700,
     )
     if world_hits:
         sections.append("=== WORLD LORE ===")
@@ -266,7 +290,8 @@ def _fetch_writing_context(novel_id: int) -> str:
     char_hits = _safe_search(
         COLLECTION_CHARACTERS,
         "character backstory personality abilities arc fatal flaw",
-        k=6,
+        k=5,
+        max_chars=900,
     )
     if char_hits:
         sections.append("\n=== CHARACTERS ===")
@@ -278,7 +303,8 @@ def _fetch_writing_context(novel_id: int) -> str:
     creature_hits = _safe_search(
         COLLECTION_CREATURES,
         "creature ecology magical traits threat level lore",
-        k=4,
+        k=3,
+        max_chars=700,
     )
     if creature_hits:
         sections.append("\n=== CREATURES ===")
@@ -705,6 +731,17 @@ class ProseStylistOutput(BaseModel):
             "Stored in the AgentLog for transparency."
         )
     )
+    chapter_summary: str = Field(
+        description=(
+            "A concise 2-4 sentence recap, in past tense third person, of this "
+            "chapter's key events, character developments, and any unresolved "
+            "plot threads or open questions. Do not include stylistic commentary. "
+            "This is stored for continuity and read by the Plot Agent when "
+            "outlining the NEXT chapter, so it must capture whatever a writer "
+            "would need to remember to keep the story consistent — without "
+            "repeating the full prose."
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -762,12 +799,20 @@ _PROSE_PROMPT = ChatPromptTemplate.from_messages([
 # ---------------------------------------------------------------------------
 
 
-def _finalize_chapter(chapter_id: int, polished_prose: str) -> None:
-    """Overwrite Chapter.content with the polished text (Story 3.6.1)."""
+def _finalize_chapter(chapter_id: int, polished_prose: str, summary: str) -> None:
+    """
+    Overwrite Chapter.content with the polished text and store the compact
+    continuity ``summary`` (Story 3.6.1).
+
+    The summary is read back cheaply by the Plot Agent when outlining the
+    next chapter — a few sentences from SQLite instead of re-embedding the
+    full prior chapter into every future prompt.
+    """
     with Session(engine) as session:
         chapter = session.get(Chapter, chapter_id)
         if chapter:
             chapter.content = polished_prose
+            chapter.summary = summary
             session.commit()
 
 
@@ -841,7 +886,7 @@ async def prose_stylist(state: NovelState) -> dict[str, Any]:
 
         # Persist to SQLite — Story 3.6.1
         if chapter_id:
-            _finalize_chapter(chapter_id, polished)
+            _finalize_chapter(chapter_id, polished, result.chapter_summary)
 
         _log_prose(
             novel_id, "completed",

@@ -31,11 +31,11 @@ from typing import Any, Optional
 from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from src.agents.state import NovelState
-from src.db.models import AgentLog, Chapter, Character, Novel, engine
+from src.db.models import AgentLog, Chapter, Character, Creature, Novel, engine
 from src.db.vector_store import (
     COLLECTION_CHARACTERS,
     COLLECTION_PLOT_BEATS,
@@ -58,9 +58,12 @@ def _build_llm() -> BaseChatModel:
     """
     Instantiate the chat model from environment variables.
 
-    LLM_PROVIDER    — "openai" (default) | "anthropic" | "google"
-    LLM_MODEL       — model name (e.g. "gpt-4o")
-    LLM_TEMPERATURE — float, default 0.85
+    LLM_PROVIDER            — "openai" (default) | "anthropic" | "google"
+    LLM_MODEL               — model name (e.g. "gpt-4o")
+    LLM_TEMPERATURE         — float, default 0.85
+    LLM_MAX_TOKENS_STRUCTURED — int, default 4096. Caps structured-JSON output
+                              (world/creature/character/plot) so a verbose
+                              completion can't silently burn excess tokens.
     """
     from dotenv import load_dotenv
     load_dotenv()  # no-op if already loaded; ensures .env is read in non-UI entry points
@@ -68,21 +71,22 @@ def _build_llm() -> BaseChatModel:
     provider = os.getenv("LLM_PROVIDER", "openai").lower()
     model = os.getenv("LLM_MODEL", "gpt-4o")
     temperature = float(os.getenv("LLM_TEMPERATURE", "0.85"))
+    max_tokens = int(os.getenv("LLM_MAX_TOKENS_STRUCTURED", "4096"))
 
     if provider == "openai":
         from langchain_openai import ChatOpenAI  # type: ignore[import]
 
-        return ChatOpenAI(model=model, temperature=temperature)
+        return ChatOpenAI(model=model, temperature=temperature, max_tokens=max_tokens)
 
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic  # type: ignore[import]
 
-        return ChatAnthropic(model=model, temperature=temperature)  # type: ignore[call-arg]
+        return ChatAnthropic(model=model, temperature=temperature, max_tokens=max_tokens)  # type: ignore[call-arg]
 
     if provider == "google":
         from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore[import]
 
-        return ChatGoogleGenerativeAI(model=model, temperature=temperature)
+        return ChatGoogleGenerativeAI(model=model, temperature=temperature, max_output_tokens=max_tokens)
 
     raise ValueError(
         f"Unsupported LLM_PROVIDER '{provider}'. Choose from: openai, anthropic, google."
@@ -243,6 +247,9 @@ def _fetch_lore_for_characters(novel_id: int) -> tuple[str, str]:
     tuple[str, str]
         ``(world_lore_context, creature_context)`` — formatted strings ready
         for injection into the LLM prompt.
+
+    Token efficiency: ``k`` is capped to the minimum breadth needed and every
+    hit is truncated via ``max_chars`` to bound worst-case prompt size.
     """
     # Pull kingdoms and magic rules — the primary grounding for character origins
     # and ability sets.  We use broad semantic queries so the embeddings do the
@@ -250,26 +257,30 @@ def _fetch_lore_for_characters(novel_id: int) -> tuple[str, str]:
     kingdom_hits = search_lore(
         COLLECTION_WORLD_LORE,
         query="kingdoms factions culture government society people religion",
-        k=5,
+        k=4,
         where={"$and": [{"novel_id": novel_id}, {"type": "kingdom"}]},
+        max_chars=700,
     )
     magic_hits = search_lore(
         COLLECTION_WORLD_LORE,
         query="magic abilities powers practitioners limitations cost",
         k=3,
         where={"$and": [{"novel_id": novel_id}, {"type": "magic_rule"}]},
+        max_chars=700,
     )
     history_hits = search_lore(
         COLLECTION_WORLD_LORE,
         query="historical events wars betrayals tragedies that shape characters",
         k=2,
         where={"$and": [{"novel_id": novel_id}, {"type": "history"}]},
+        max_chars=700,
     )
     creature_hits = search_lore(
         COLLECTION_CREATURES,
         query="dangerous creatures relationships threat ecological role encounters",
-        k=6,
+        k=5,
         where={"novel_id": novel_id},
+        max_chars=700,
     )
 
     world_sections: list[str] = []
@@ -544,6 +555,11 @@ Guidelines:
 - At least one beat must include a meaningful creature encounter (not decorative).
 - Locations must be named places from the world context; do not invent new places.
 - The chapter ending must change something irreversibly.
+- CONTINUITY IS CRITICAL: read "STORY SO FAR" below carefully. The opening beat \
+  must flow naturally from the previous chapter's ending — do not abruptly jump \
+  timeframes, locations, or emotional states without a deliberate, earned transition. \
+  At least one beat must advance or resolve a thread explicitly left open in the \
+  prior chapter(s).
 - Return ONLY valid structured JSON matching the required schema.
 """
 
@@ -553,6 +569,9 @@ NOVEL BRIEF
   Tone:   {tone}
 
 CHAPTER TARGET: Chapter {chapter_number}
+
+STORY SO FAR  (recent chapter recaps — ensure a smooth transition from this)
+{story_so_far}
 
 WORLD CONTEXT
 {world_context}
@@ -634,6 +653,90 @@ def _get_next_chapter_number(novel_id: int) -> int:
     return count + 1
 
 
+def _truncate(text: str, max_chars: int) -> str:
+    """Hard-cap a plain string at *max_chars* for prompt-size safety."""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "… [truncated]"
+
+
+def _fetch_story_so_far(novel_id: int, limit: int = 3) -> str:
+    """
+    Build a compact continuity brief from the most recent chapters so the
+    next chapter opens with a smooth, causally-connected transition.
+
+    Token efficiency: reads the short ``Chapter.summary`` written by the
+    Prose Stylist (a few sentences) instead of re-embedding full prior
+    chapter prose (thousands of words) into every future Plot Agent prompt.
+    Falls back to a truncated excerpt of ``content`` for older chapters
+    generated before the summary field existed.
+    """
+    with Session(engine) as session:
+        rows = session.scalars(
+            select(Chapter)
+            .where(Chapter.novel_id == novel_id)
+            .order_by(desc(Chapter.chapter_number))
+            .limit(limit)
+        ).all()
+        chapters = [
+            {
+                "chapter_number": row.chapter_number,
+                "title": row.title or "",
+                "summary": row.summary or "",
+                "content": row.content or "",
+            }
+            for row in rows
+        ]
+
+    if not chapters:
+        return "This is the opening chapter of the novel — there are no prior events."
+
+    chapters.reverse()  # chronological order (oldest of the window first)
+    lines: list[str] = []
+    for ch in chapters:
+        recap = ch["summary"].strip() or _truncate(ch["content"], 400)
+        lines.append(f"Chapter {ch['chapter_number']} ({ch['title']}): {recap}")
+
+    return "\n".join(lines)
+
+
+def _fetch_creatures_summary_from_db(novel_id: int) -> str:
+    """
+    Fallback bestiary summary read directly from SQLite.
+
+    Used when ``NovelState['creatures_list']`` is empty — true for every
+    "Generate Next Chapter" run, since each chapter execution starts from a
+    fresh state and creatures are only produced once, during initial setup.
+    """
+    with Session(engine) as session:
+        rows = session.scalars(
+            select(Creature).where(Creature.novel_id == novel_id)
+        ).all()
+        if not rows:
+            return "No creatures generated yet."
+        return "\n".join(
+            f"• {row.name} (Threat: unspecified) — {row.ecology or ''}" for row in rows
+        )
+
+
+def _fetch_world_overview_fallback(novel_id: int) -> str:
+    """
+    Fallback world summary read from ChromaDB when ``NovelState['world_context']``
+    is empty (true for "Generate Next Chapter" runs). A single compact
+    ``world_overview`` document is enough grounding here since
+    ``_fetch_context_for_plot`` already retrieves targeted kingdom/history
+    details separately.
+    """
+    hits = search_lore(
+        COLLECTION_WORLD_LORE,
+        query="world overview geography cosmology",
+        k=1,
+        where={"$and": [{"novel_id": novel_id}, {"type": "world_overview"}]},
+        max_chars=800,
+    )
+    return hits[0]["text"] if hits else "No world context in state."
+
+
 def _fetch_context_for_plot(novel_id: int) -> str:
     """
     Query ChromaDB for the full character dossiers and relevant world lore.
@@ -646,12 +749,14 @@ def _fetch_context_for_plot(novel_id: int) -> str:
         query="character backstory motivation arc personality abilities fatal flaw",
         k=8,
         where={"novel_id": novel_id},
+        max_chars=900,
     )
     world_hits = search_lore(
         COLLECTION_WORLD_LORE,
         query="locations geography kingdoms conflict history tension unresolved",
         k=4,
         where={"novel_id": novel_id},
+        max_chars=700,
     )
 
     sections: list[str] = []
@@ -738,12 +843,23 @@ def _log_plot_error(novel_id: int, error_message: str) -> None:
 
 async def plot_agent(state: NovelState) -> dict[str, Any]:
     """
-    LangGraph node — Plot Agent  (Story 3.3).
+    LangGraph node — Plot Agent  (Story 3.3, extended for chapter-by-chapter
+    continuation).
 
     Determines the next chapter number, retrieves full character dossiers and
-    world lore from ChromaDB, prompts the LLM for a structured
+    world lore from ChromaDB, pulls a compact "story so far" recap of recent
+    chapters from SQLite for continuity, prompts the LLM for a structured
     ``ChapterOutline``, persists the outline to ChromaDB, and returns the
     formatted ``current_outline`` string for the state.
+
+    Runs in two contexts:
+    - First chapter (part of the initial setup+chapter-1 graph): ``state``
+      carries ``world_context`` / ``creatures_list`` produced earlier in the
+      same run.
+    - Subsequent chapters (triggered by the "Generate Next Chapter" button,
+      via the standalone chapter graph): ``state`` starts empty, so this node
+      falls back to SQLite/ChromaDB for world and creature grounding instead
+      of requiring the full upstream pipeline to re-run.
     """
     novel_id: int = state["novel_id"]
     world_context: str = state.get("world_context", "")
@@ -767,8 +883,26 @@ async def plot_agent(state: NovelState) -> dict[str, Any]:
         None, _fetch_context_for_plot, novel_id
     )
 
-    # Fall back to state creature list summary if ChromaDB has nothing
-    creatures_summary = _summarise_creatures(creatures_list)
+    # Compact continuity brief — cheap SQLite read, not a full chapter replay
+    story_so_far: str = await loop.run_in_executor(
+        None, _fetch_story_so_far, novel_id
+    )
+
+    # Fall back to a direct DB/ChromaDB read when state was started fresh
+    # (i.e. this is a "Generate Next Chapter" run, not the initial setup pass).
+    if creatures_list:
+        creatures_summary = _summarise_creatures(creatures_list)
+    else:
+        creatures_summary = await loop.run_in_executor(
+            None, _fetch_creatures_summary_from_db, novel_id
+        )
+
+    if world_context:
+        resolved_world_context = world_context
+    else:
+        resolved_world_context = await loop.run_in_executor(
+            None, _fetch_world_overview_fallback, novel_id
+        )
 
     try:
         chain = _PLOT_PROMPT | _build_llm().with_structured_output(ChapterOutline)
@@ -777,7 +911,8 @@ async def plot_agent(state: NovelState) -> dict[str, Any]:
                 "genre": genre,
                 "tone": tone,
                 "chapter_number": chapter_number,
-                "world_context": world_context or "No world context in state.",
+                "story_so_far": story_so_far,
+                "world_context": resolved_world_context,
                 "character_context": character_context,
                 "creatures_summary": creatures_summary,
             }

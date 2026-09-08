@@ -28,7 +28,7 @@ from typing import Literal, NamedTuple, Optional
 
 from sqlalchemy.orm import Session
 
-from src.agents.graph import execute_graph
+from src.agents.graph import execute_graph, execute_next_chapter
 from src.db.models import AgentLog, engine
 
 logger = logging.getLogger(__name__)
@@ -110,6 +110,28 @@ def _graph_thread_target(novel_id: int, initial_prompt: str) -> None:
         _persist_orchestrator_error(novel_id, exc)
 
 
+def _next_chapter_thread_target(novel_id: int) -> None:
+    """
+    Thread target for a single "Generate Next Chapter" run.
+
+    Mirrors ``_graph_thread_target`` but calls ``execute_next_chapter``,
+    which skips World/Creature/Character generation entirely.
+    """
+    logger.info(
+        "[bg_thread] starting execute_next_chapter for novel_id=%s", novel_id
+    )
+    try:
+        asyncio.run(execute_next_chapter(novel_id=novel_id))
+        logger.info(
+            "[bg_thread] execute_next_chapter completed for novel_id=%s", novel_id
+        )
+    except Exception as exc:
+        logger.exception(
+            "[bg_thread] unhandled error generating next chapter for novel_id=%s", novel_id
+        )
+        _persist_orchestrator_error(novel_id, exc)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -152,6 +174,44 @@ def launch_novel_graph(
         target=_graph_thread_target,
         args=(novel_id, initial_prompt),
         name=f"novel-graph-{novel_id}",
+        daemon=True,
+    )
+    thread.start()
+    logger.info(
+        "[utils] launched background thread '%s' for novel_id=%s",
+        thread.name,
+        novel_id,
+    )
+    return thread
+
+
+def launch_next_chapter(novel_id: int) -> threading.Thread:
+    """
+    Generate the next chapter for a novel whose setup is already complete,
+    in a background daemon thread.
+
+    The thread calls ``execute_next_chapter(novel_id)`` via ``asyncio.run()``.
+    Unlike ``launch_novel_graph``, this never re-runs World/Creature/Character
+    generation — it only executes Plot → Scene Writer/Red Team → Prose Stylist
+    for one additional chapter.
+
+    Parameters
+    ----------
+    novel_id:
+        Primary key of an existing ``Novel`` row that already has at least
+        one ``Character`` row (check with ``get_novel_progress`` first).
+
+    Returns
+    -------
+    threading.Thread
+        The started daemon thread.  Store in ``st.session_state["graph_thread"]``
+        and poll ``thread.is_alive()`` to track run status across Streamlit reruns,
+        exactly as with ``launch_novel_graph``.
+    """
+    thread = threading.Thread(
+        target=_next_chapter_thread_target,
+        args=(novel_id,),
+        name=f"next-chapter-{novel_id}",
         daemon=True,
     )
     thread.start()
