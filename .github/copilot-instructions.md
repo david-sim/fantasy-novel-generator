@@ -22,3 +22,6 @@ Current stack must be preserved.
 
 ## Preferred Workflow
 1. Read the issue carefully.
+2. Make the smallest change that satisfies the acceptance criteria.
+3. Open a Draft PR linked to the issue.
+4. Summarise what you changed in the PR description.
