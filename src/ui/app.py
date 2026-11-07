@@ -14,11 +14,20 @@ Environment variables:
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 from datetime import datetime
 from typing import Any, Optional
 
+from pathlib import Path
+
 from dotenv import load_dotenv
+
+# Streamlit puts only this script's directory on sys.path; add the repo root
+# so that ``src.*`` imports resolve (e.g. on share.streamlit.io).
+_REPO_ROOT = str(Path(__file__).resolve().parents[2])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 # Load .env before any src.* module is imported so that os.getenv() calls
 # inside LangChain / SQLAlchemy constructors see the correct values.
