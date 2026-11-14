@@ -1,0 +1,31 @@
+# Core Framework
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+python-dotenv>=1.0.0
+
+# LLM Auth
+python-jose[cryptography]>=3.3.0
+
+# LangChain / LangGraph
+langchain>=0.2.0
+langchain-core>=0.2.0
+langchain-community>=0.2.0
+langgraph>=0.1.0
+
+# LLM Providers
+langchain-openai>=0.1.0
+# langchain-anthropic>=0.1.0
+
+# Database (Supabase Postgres)
+sqlalchemy>=2.0.0
+psycopg[binary]>=3.1.0
+
+# Vector Store (pgvector, replaces ChromaDB)
+pgvector>=0.3.0
+
+# Data Validation
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# Optional: Supabase server-side client (service role operations)
+supabase>=2.4.0

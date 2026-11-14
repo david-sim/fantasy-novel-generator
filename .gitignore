@@ -21,13 +21,13 @@ novelengine.db
 chroma_db/
 data/
 
-# Terraform secrets & generated files
-infra/terraform.tfvars
-infra/.terraform/
-infra/.terraform.lock.hcl
-infra/terraform.tfstate
-infra/terraform.tfstate.backup
-infra/*.tfplan
+# Terraform secrets & generated files (legacy AWS infra, deprecated)
+infra/legacy-aws-terraform/terraform.tfvars
+infra/legacy-aws-terraform/.terraform/
+infra/legacy-aws-terraform/.terraform.lock.hcl
+infra/legacy-aws-terraform/terraform.tfstate
+infra/legacy-aws-terraform/terraform.tfstate.backup
+infra/legacy-aws-terraform/*.tfplan
 
 # IDE / OS
 .vscode/
