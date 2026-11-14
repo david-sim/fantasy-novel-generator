@@ -9,9 +9,9 @@ fantasy novels. Powered by **LangGraph** for agent orchestration and
 > **FastAPI backend** + **Next.js frontend** on **Supabase** (Postgres +
 > pgvector + Auth + Storage). The full proposal is tracked in
 > `docs/architecture-redesign.md` (see PR #3 — docs-only, not yet merged).
-> This document describes the **new** architecture as of **Phase 1** of that
-> migration (scaffold, auth, persistence). Phase 2 (async job pipeline) and
-> Phase 3 (export + polish) land in follow-up PRs — see
+> This document describes the **new** architecture as of **Phase 2** of that
+> migration (scaffold, auth, persistence, async job pipeline). Phase 3
+> (export + polish) lands in a follow-up PR — see
 > [Migration status](#migration-status) below.
 
 ---
@@ -42,11 +42,13 @@ how it's invoked (FastAPI instead of Streamlit callbacks) and where it
 persists data (Postgres/pgvector via Supabase instead of SQLite/ChromaDB)
 have changed.
 
-**Phase 1 (this PR):** the `/api/novels/{id}/generate` endpoint calls
-`execute_graph()` **synchronously** — the HTTP request blocks until
-generation finishes. **Phase 2** replaces this with an async job queued via
-Upstash Redis + RQ, with the frontend polling for status instead of blocking
-on the request.
+**Phase 1:** the `/api/novels/{id}/generate` endpoint called `execute_graph()`
+**synchronously** — the HTTP request blocked until generation finished.
+**Phase 2 (this PR):** `/generate` enqueues an async job on a Redis queue
+(RQ) and returns a `job_id` immediately (`202 Accepted`); a separate
+**worker** process pulls jobs off the queue and runs `execute_graph()`. The
+frontend polls `GET /api/novels/{id}/jobs/{job_id}` on a simple interval
+(no websockets/SSE) to show live progress and the final result.
 
 ---
 
@@ -69,9 +71,11 @@ fantasy-novel-generator/
 │   │   │   └── vector_store.py    # pgvector-backed lore store (replaces ChromaDB)
 │   │   ├── core/
 │   │   │   ├── config.py          # Env-driven settings
-│   │   │   └── auth.py            # Supabase JWT verification dependency
+│   │   │   ├── auth.py            # Supabase JWT verification dependency
+│   │   │   └── queue.py           # Shared Redis connection + RQ queue accessor
 │   │   ├── api/
-│   │   │   └── novels.py          # REST endpoints: list/detail/generate
+│   │   │   └── novels.py          # REST endpoints: list/detail/generate/job-status
+│   │   ├── worker.py               # RQ worker entrypoint (Phase 2 async jobs)
 │   │   └── main.py                # FastAPI app, CORS, routing, startup
 │   ├── tests/
 │   │   └── test_api_auth.py       # Route wiring + auth-enforcement smoke tests
@@ -83,7 +87,7 @@ fantasy-novel-generator/
 │   │   ├── login/                 # Google sign-in via Supabase Auth
 │   │   ├── auth/callback/         # OAuth code exchange route
 │   │   ├── novels/                # Protected "My Novels" library page
-│   │   └── novels/[id]/           # Novel detail: chapters/characters/creatures
+│   │   └── novels/[id]/           # Novel detail + GenerationPanel (trigger/poll jobs)
 │   ├── lib/
 │   │   ├── supabaseClient.ts      # Browser Supabase client
 │   │   ├── supabaseServer.ts      # Server Supabase client (cookies)
@@ -95,8 +99,9 @@ fantasy-novel-generator/
 │   └── legacy-aws-terraform/      # DEPRECATED — old ECS/RDS/EFS Terraform, kept for reference only
 ├── docs/
 │   └── architecture-redesign.md   # Full migration proposal
+├── docker-compose.yml             # Optional local dev: redis + pgvector postgres + api + worker
 └── .github/workflows/
-    ├── backend.yml                # Install deps, pytest, Docker build
+    ├── backend.yml                # Install deps, pytest, worker import smoke test, Docker build
     └── frontend.yml                # npm ci, lint, next build
 ```
 
@@ -113,7 +118,7 @@ fantasy-novel-generator/
 | Supabase Auth (Google OAuth) + JWT verification | ✅ Phase 1 |
 | Next.js frontend (library + detail pages) | ✅ Phase 1 |
 | Streamlit UI | ❌ Removed in Phase 1 |
-| Async job queue (Upstash Redis + RQ) | ⏳ Phase 2 |
+| Async job queue (Redis + RQ) + polling UI | ✅ Phase 2 |
 | Markdown / PDF export (WeasyPrint) | ⏳ Phase 3 |
 | AWS Terraform (ECS/RDS/EFS) | ❌ Removed, see `infra/legacy-aws-terraform/` |
 
@@ -153,7 +158,35 @@ The backend starts on [http://localhost:8000](http://localhost:8000)
 (`/health` for a liveness check, `/docs` for the OpenAPI UI). On startup it
 creates the `vector` extension and any missing tables/columns.
 
-### 2 — Frontend (Next.js)
+### 2 — Redis + worker (Phase 2 async jobs)
+
+`POST /api/novels/{id}/generate` enqueues a job on Redis; a separate worker
+process runs it. Either:
+
+- **Local Redis directly:** run `redis-server` (or any local Redis), set
+  `REDIS_URL=redis://localhost:6379/0` in `backend/.env`, then in a second
+  terminal:
+
+  ```bash
+  cd backend
+  python -m app.worker
+  # equivalently: rq worker novel-generation --url redis://localhost:6379/0
+  ```
+
+- **Or via Docker Compose** (also spins up a local pgvector Postgres so you
+  don't need a Supabase project for local iteration):
+
+  ```bash
+  cp backend/.env.example backend/.env   # fill in SUPABASE_*, OPENAI_API_KEY
+  docker compose up --build
+  ```
+
+  This starts `redis`, `postgres`, `api` (port 8000), and `worker`. See
+  `docker-compose.yml` for details — it's a local dev convenience only;
+  production still targets Supabase Postgres + an Upstash-compatible Redis
+  endpoint (see [Deployment](#deployment)).
+
+### 3 — Frontend (Next.js)
 
 ```bash
 cd frontend
@@ -169,7 +202,7 @@ Open [http://localhost:3000](http://localhost:3000). In your Supabase
 project, enable the Google OAuth provider and add
 `http://localhost:3000/auth/callback` as a redirect URL.
 
-### 3 — Running backend tests
+### 4 — Running backend tests
 
 ```bash
 cd backend
@@ -177,11 +210,10 @@ pip install pytest httpx
 pytest -v
 ```
 
-Phase 1 ships route-wiring and auth-enforcement smoke tests only — no
-pre-existing test suite was found to migrate (the README previously
-referenced a `tests/` directory that did not exist in the repository).
-Tests run against a mocked JWT secret; no live Postgres/Supabase instance is
-required.
+Phase 1 shipped route-wiring and auth-enforcement smoke tests. Phase 2 adds
+one for the new job-status route, plus a CI step that import-smoke-tests
+`app.worker`. Tests run against a mocked JWT secret; no live Postgres/Redis
+instance is required.
 
 ---
 
@@ -190,17 +222,27 @@ required.
 - **Frontend**: Vercel, connected via its own GitHub integration pointed at
   the `frontend/` directory as the project root (automatic preview + prod
   deploys — no custom GitHub Actions deploy step).
-- **Backend**: an always-on container on **Render** or **Fly.io** (not
-  Vercel serverless functions, since novel generation can take several
-  minutes per request — longer than typical serverless function limits).
-  `backend/Dockerfile` builds the image; `.github/workflows/backend.yml`
-  verifies it builds in CI.
+- **Backend**: **two always-on processes** from the same `backend/Dockerfile`
+  image, run as separate services:
+  - **web** — `uvicorn app.main:app --host 0.0.0.0 --port 8000` (the API).
+  - **worker** — `python -m app.worker` (processes queued generation jobs).
+
+  Both deployed on **Render** or **Fly.io** rather than Vercel: novel
+  generation can take several minutes, longer than typical serverless
+  function limits, and Vercel has no first-class way to run a persistent
+  background worker alongside a web service from the same repo/image —
+  Render and Fly.io both support a web service + a separate background
+  worker service from one repo, which is why they were chosen for the
+  backend. `.github/workflows/backend.yml` verifies the image builds and
+  that `app.worker` imports cleanly in CI.
 - **Database / Auth / Storage**: Supabase (hosted Postgres + pgvector +
   Auth + Storage).
-- **Jobs** (Phase 2): Upstash Redis + RQ.
+- **Jobs**: an Upstash-compatible Redis endpoint (or any Redis reachable via
+  `REDIS_URL`) + RQ.
 
 Target budget: roughly $20–50/month overall (Supabase free/pro tier, a small
-Render/Fly.io instance, Vercel free tier, Upstash free tier).
+Render/Fly.io instance for each of web + worker, Vercel free tier, Upstash
+free tier).
 
 ---
 
@@ -214,6 +256,7 @@ Render/Fly.io instance, Vercel free tier, Upstash free tier).
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase service-role key (server-side only, never exposed to the frontend) |
 | `SUPABASE_JWT_SECRET` | Shared secret used to verify Supabase Auth JWTs |
 | `DATABASE_URL` | Postgres connection string (Supabase connection pooler recommended) |
+| `REDIS_URL` | Redis connection string for the async job queue (Upstash-compatible endpoint in production, `redis://localhost:6379/0` for local dev) — read by both the API (`web`) and `app.worker` |
 | `OPENAI_API_KEY` | API key for OpenAI |
 | `LLM_MODEL` | Model name passed to LangChain, e.g. `gpt-4o` |
 | `LLM_TEMPERATURE` | Generation temperature |

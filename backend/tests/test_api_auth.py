@@ -44,3 +44,8 @@ def test_invalid_bearer_token_rejected():
         "/api/novels", headers={"Authorization": "Bearer not-a-real-jwt"}
     )
     assert response.status_code == 401
+
+
+def test_job_status_requires_auth():
+    response = client.get("/api/novels/1/jobs/some-job-id")
+    assert response.status_code == 401

@@ -1,6 +1,7 @@
 import { redirect } from "next/navigation";
 import { createServerSupabaseClient } from "@/lib/supabaseServer";
 import { getNovel } from "@/lib/api";
+import GenerationPanel from "./GenerationPanel";
 
 export default async function NovelDetailPage({ params }: { params: { id: string } }) {
   const supabase = createServerSupabaseClient();
@@ -20,6 +21,8 @@ export default async function NovelDetailPage({ params }: { params: { id: string
         <h1 className="text-2xl font-semibold">{novel.title}</h1>
         {novel.synopsis && <p className="mt-2 text-gray-600">{novel.synopsis}</p>}
       </div>
+
+      <GenerationPanel novelId={novel.id} />
 
       <section>
         <h2 className="mb-2 text-lg font-semibold">Chapters</h2>

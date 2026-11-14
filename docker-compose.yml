@@ -1,0 +1,59 @@
+# Local development only — covers api + worker + redis + a local pgvector
+# Postgres so the full Phase 2 async pipeline can be exercised offline
+# without a hosted Supabase project or Upstash Redis instance.
+#
+# Production still targets Supabase-managed Postgres/Auth and an
+# Upstash-compatible Redis endpoint (see README "Deployment"); this compose
+# file is a convenience for contributors, not a deployment artifact.
+#
+# Usage:
+#   cp backend/.env.example backend/.env   # fill in SUPABASE_*, OPENAI_API_KEY, etc.
+#   docker compose up --build
+#
+# The frontend (Next.js) is intentionally not included here — run it
+# separately with `cd frontend && npm run dev` against API_URL=http://localhost:8000.
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  postgres:
+    image: ankane/pgvector:latest
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: novelengine
+    ports:
+      - "5432:5432"
+    volumes:
+      - novelengine-postgres-data:/var/lib/postgresql/data
+
+  api:
+    build: ./backend
+    env_file:
+      - ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/novelengine
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - redis
+
+  worker:
+    build: ./backend
+    env_file:
+      - ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/novelengine
+      REDIS_URL: redis://redis:6379/0
+    command: ["python", "-m", "app.worker"]
+    depends_on:
+      - postgres
+      - redis
+
+volumes:
+  novelengine-postgres-data:

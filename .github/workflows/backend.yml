@@ -46,6 +46,14 @@ jobs:
           OPENAI_API_KEY: sk-test
         run: pytest -v
 
+      # Phase 2: the worker entrypoint must import cleanly (Redis connections
+      # are lazy, so this needs no running Redis server in CI).
+      - name: Verify worker entrypoint imports
+        env:
+          SUPABASE_JWT_SECRET: test-secret
+          OPENAI_API_KEY: sk-test
+        run: python -c "import app.worker; print('app.worker import OK')"
+
   docker-build:
     name: Build Docker image
     runs-on: ubuntu-latest
