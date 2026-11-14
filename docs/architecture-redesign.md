@@ -40,9 +40,10 @@ that:
 - Lives in a **single monorepo** with independently deployable frontend and
   backend pipelines.
 
-This is a proposal only. Section 10 lays out a phased path to implement it,
-and Section 11 lists open questions for you to weigh in on before any build
-work starts.
+This is a proposal only. Section 10 lays out a phased path to implement it.
+An initial round of open questions was raised and has since been answered
+by the user; Section 11 records those as resolved decisions (simple HTTP
+polling, full Streamlit retirement, Markdown + PDF export).
 
 ---
 
@@ -180,8 +181,8 @@ Worker   → runs execute_graph() (existing, unchanged LangGraph pipeline)
 Worker   → each agent node's writes go to Postgres (AgentLog) + pgvector, as today
 Worker   → on completion, sets Job.status=done, Novel.status=complete
 Frontend → polls GET /jobs/{id} every ~2-3s (same cadence as today's
-           Streamlit fragment), or switches to Postgres LISTEN/NOTIFY +
-           Supabase Realtime subscription later if polling proves too chatty
+           Streamlit fragment) — simple HTTP polling, confirmed as the
+           final approach; no websockets/SSE/Realtime subscription planned
 ```
 
 | Option | Notes |
@@ -248,12 +249,32 @@ consolidating onto Postgres removes an entire service from the ops surface.
 
 | Option | Notes |
 |---|---|
-| **Supabase Storage** — *recommended* | Needed for exported novel files (e.g., EPUB/PDF/Markdown export) and any generated cover art. Included in the Supabase project you're already paying for (1 GB free, cheap per-GB beyond that), with Row Level Security so a user can only access their own files. |
+| **Supabase Storage** — *recommended* | Needed for exported novel files (Markdown and PDF — confirmed formats, see below) and any generated cover art. Included in the Supabase project you're already paying for (1 GB free, cheap per-GB beyond that), with Row Level Security so a user can only access their own files. |
 | Vercel Blob | Reasonable if you wanted to keep storage entirely on the Vercel side; adds a 4th billing surface for something Supabase already covers. |
 | AWS S3 | Most standard/portable option, but introduces an AWS account/IAM surface purely for file storage when Supabase Storage already satisfies the need. |
 
 **Recommendation:** Supabase Storage. **Sacrificed by not choosing it:**
 S3's broader ecosystem/tooling maturity — not needed at this scale.
+
+**Export formats (confirmed): Markdown and PDF only** (no EPUB). Markdown
+export is essentially free — it's a direct serialization of the chapter
+text already stored in Postgres, written straight to Supabase Storage.
+PDF requires a rendering step, compared below:
+
+| PDF rendering option | Notes |
+|---|---|
+| **WeasyPrint** (Python, HTML/CSS → PDF) — *recommended* | Pure-Python, runs in the same worker process/container as the LangGraph pipeline (no extra service to deploy), renders a Markdown→HTML template (title page, chapter headings, styled body text) to PDF. Adds a Python/system dependency (Pango/Cairo) to the backend Docker image, but no added hosting cost and no extra network hop. |
+| ReportLab | Also pure-Python and dependency-light, but its layout model is lower-level (manual flowables/canvas) — more code to get decent-looking chapter typography than WeasyPrint's CSS-driven approach for a comparable result. |
+| Headless Chromium (e.g., Playwright/Puppeteer rendering an HTML page to PDF) | Produces the highest-fidelity output (full CSS/web-font support) but requires shipping a Chromium binary in the worker image — notably larger image size and memory footprint for a prototype-scale feature. |
+| Managed PDF API (e.g., a hosted HTML-to-PDF service) | Removes the rendering dependency from our own container, but adds a 5th paid vendor and an external network call (plus its own cost-per-document) for a feature we can run in-process for free compute-wise. |
+
+**Recommendation:** WeasyPrint, invoked by the worker right after a novel
+completes generation (or on-demand via an `/novels/{id}/export?format=pdf`
+endpoint that renders once and caches the result in Supabase Storage).
+**Tradeoff accepted:** WeasyPrint's typographic output is good but not as
+polished as a full browser-rendering engine (headless Chromium) — acceptable
+for a validation-stage export feature, and avoids adding Chromium's
+image-size/memory cost or a 5th external vendor.
 
 ### 4.8 LLM provider: direct OpenAI vs. OpenRouter
 
@@ -315,11 +336,11 @@ fantasy-novel-generator/
 │   │   └── tasks.py                # enqueue/execute_graph() glue
 │   ├── src/                        # EXISTING pipeline, unchanged in place
 │   │   ├── agents/                 # graph.py, state.py, nodes/ (as today)
-│   │   ├── db/                     # models.py, vector_store.py
-│   │   │                            #   (vector_store.py gains a pgvector
-│   │   │                            #    backend behind the same interface)
-│   │   └── ui/                     # legacy Streamlit UI kept for now,
-│   │                                #   or removed once frontend replaces it
+│   │   └── db/                     # models.py, vector_store.py
+│   │                                #   (vector_store.py gains a pgvector
+│   │                                #    backend behind the same interface)
+│   │                                #   (src/ui/ Streamlit app is removed —
+│   │                                #    fully retired in favor of frontend/)
 │   ├── tests/                      # existing pytest suite, unchanged
 │   ├── Dockerfile                  # backend-only image (API + worker)
 │   └── requirements.txt
@@ -352,7 +373,9 @@ This keeps the existing `src/agents` and `src/db` packages intact (moved
 under `backend/src/` with no internal changes expected beyond the storage
 backend swap), so the multi-agent pipeline itself is untouched — only how it
 is invoked (worker task vs. Streamlit background thread) and how it persists
-data (Supabase Postgres/pgvector vs. local SQLite/Chroma) change.
+data (Supabase Postgres/pgvector vs. local SQLite/Chroma) change. `src/ui/`
+(the Streamlit app) is **fully retired**, not carried forward even as a
+fallback/admin tool — the Next.js frontend becomes the sole UI.
 
 ---
 
@@ -596,23 +619,31 @@ Swap `src/db/vector_store.py`'s ChromaDB backend for a pgvector-backed
 implementation behind the same interface.
 
 **Phase 3 — Polish**
-Add novel export (PDF/EPUB/Markdown) to Supabase Storage, cover image
-generation/storage, nicer live-progress UI (consider swapping polling for
-Supabase Realtime subscriptions on the `Job`/`AgentLog` tables), basic
-observability (error reporting, job retry/backoff tuning), and decide
-whether/when to retire the legacy Streamlit UI entirely.
+Add novel export (Markdown and PDF via WeasyPrint — see Section 4.7) to
+Supabase Storage, cover image generation/storage, basic observability
+(error reporting, job retry/backoff tuning), and remove `src/ui/` (the
+Streamlit app) entirely now that the Next.js frontend is the sole UI.
 
 ---
 
-## 11. Open Questions
+## 11. Open Questions — Resolved
 
-1. **Realtime vs. polling:** Are you OK starting with simple HTTP polling
-   for job status (matching today's 2-second Streamlit cadence), with
-   Supabase Realtime/websockets as a Phase 3 enhancement rather than a
-   Phase 1 requirement?
-2. **Legacy Streamlit UI:** Should the existing Streamlit app be kept
-   running (e.g., as an internal/admin tool) after the Next.js frontend
-   ships, or fully retired once the new UI reaches parity?
-3. **Export formats:** Do you have a specific priority order for novel
-   export formats (Markdown, PDF, EPUB), or should Phase 3 start with
-   plain Markdown/HTML export and add others based on validation feedback?
+The following were raised as open questions and have since been answered by
+the user; they are recorded here as confirmed decisions rather than
+questions still pending.
+
+1. **Polling vs. Realtime:** **Resolved — simple HTTP polling.** The job
+   status endpoint (`GET /jobs/{id}`) is polled every ~2-3s from the
+   frontend, matching today's Streamlit cadence. No websockets, SSE, or
+   Supabase Realtime subscription is planned; this keeps the client
+   implementation simple and avoids an additional moving part for a
+   validation-stage app.
+2. **Streamlit retirement:** **Resolved — fully retired.** `src/ui/` is
+   removed as part of this migration; the Next.js frontend is the sole UI
+   from Phase 1 onward (no fallback/admin Streamlit instance is kept
+   running).
+3. **Export formats:** **Resolved — Markdown and PDF only** (no EPUB). PDF
+   rendering uses WeasyPrint in the worker process (see Section 4.7 for the
+   comparison against ReportLab, headless-Chromium rendering, and managed
+   PDF APIs, and the tradeoff accepted by choosing WeasyPrint).
+
