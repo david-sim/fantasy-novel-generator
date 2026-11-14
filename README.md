@@ -1,205 +1,232 @@
 # NovelEngine
 
-A multi-agent generative AI system that autonomously writes publication-grade fantasy novels. Powered by **LangGraph** for agent orchestration, **LangChain** for LLM calls, **ChromaDB** for lore retrieval, and **Streamlit** for a real-time dashboard.
+A multi-agent generative AI system that autonomously writes publication-grade
+fantasy novels. Powered by **LangGraph** for agent orchestration and
+**LangChain** for LLM calls.
+
+> **Architecture migration in progress.** This repo is moving from a
+> single-container Streamlit + SQLite + ChromaDB app to a monorepo of a
+> **FastAPI backend** + **Next.js frontend** on **Supabase** (Postgres +
+> pgvector + Auth + Storage). The full proposal is tracked in
+> `docs/architecture-redesign.md` (see PR #3 — docs-only, not yet merged).
+> This document describes the **new** architecture as of **Phase 1** of that
+> migration (scaffold, auth, persistence). Phase 2 (async job pipeline) and
+> Phase 3 (export + polish) land in follow-up PRs — see
+> [Migration status](#migration-status) below.
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                        LangGraph Pipeline                        │
-│                                                                  │
-│  WorldArchitect → CreatureArchitect → CharacterAgent → PlotAgent │
-│                                                                  │
-│       ┌─────────────────────────────────┐                        │
-│       ▼                                 │ score < 8              │
-│  SceneWriter → RedTeamAuditor ──────────┘                        │
-│                    │                                             │
-│                    │ score ≥ 8 (or loop cap reached)             │
-│                    ▼                                             │
-│              ProseStylist → END                                  │
-└──────────────────────────────────────────────────────────────────┘
-         │                          │
-    SQLite / RDS               ChromaDB (EFS)
-    (AgentLog, Novel,          (world lore, creatures,
-     Chapter, Character,        characters, plot beats)
-     Creature)
+┌────────────────────────────┐        ┌──────────────────────────────────────┐
+│   Next.js (Vercel)         │  HTTPS │   FastAPI (Render / Fly.io)           │
+│   App Router + TypeScript  │ ─────▶ │   backend/app/main.py                 │
+│   Supabase Auth (Google)   │  Bearer│                                        │
+│   /login, /novels,         │  JWT   │   LangGraph pipeline (unchanged):     │
+│   /novels/[id]             │ ◀───── │   WorldArchitect → CreatureArchitect  │
+└────────────┬───────────────┘        │   → CharacterAgent → PlotAgent →      │
+             │                        │   SceneWriter ⇄ RedTeamAuditor →      │
+             │ Supabase session       │   ProseStylist                        │
+             ▼                        └───────────────┬───────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────┐
+│                                Supabase                                    │
+│  Auth (Google OAuth)   │   Postgres (Novel/Chapter/Character/Creature)     │
+│                        │   pgvector (lore embeddings, replaces ChromaDB)   │
+│                        │   Storage (future: generated exports)            │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Each agent writes to both a **SQLite database** (structured data) and a **ChromaDB vector store** (semantic search for lore retrieval). The Streamlit UI polls the `AgentLog` table every 2 seconds via `@st.fragment(run_every=2)` to display live agent activity without full-page reruns.
+The LangGraph agent pipeline itself is **unchanged** by this migration — only
+how it's invoked (FastAPI instead of Streamlit callbacks) and where it
+persists data (Postgres/pgvector via Supabase instead of SQLite/ChromaDB)
+have changed.
+
+**Phase 1 (this PR):** the `/api/novels/{id}/generate` endpoint calls
+`execute_graph()` **synchronously** — the HTTP request blocks until
+generation finishes. **Phase 2** replaces this with an async job queued via
+Upstash Redis + RQ, with the frontend polling for status instead of blocking
+on the request.
 
 ---
 
 ## Project Structure
 
 ```
-fantansy-novel-generator/
-├── src/
-│   ├── agents/
-│   │   ├── state.py              # NovelState TypedDict (single source of truth)
-│   │   ├── graph.py              # StateGraph, conditional routing, execute_graph()
-│   │   └── nodes/
-│   │       ├── world_and_creature.py   # WorldArchitect + CreatureArchitect nodes
-│   │       └── planning.py             # CharacterAgent + PlotAgent nodes
-│   ├── db/
-│   │   ├── models.py             # SQLAlchemy 2.0 ORM models
-│   │   ├── init_db.py            # Schema bootstrap (idempotent)
-│   │   └── vector_store.py       # ChromaDB client wrapper
-│   └── ui/
-│       ├── app.py                # Streamlit application
-│       └── utils.py              # Background thread execution helpers
-├── tests/
-│   ├── conftest.py               # Stubs for chromadb / langchain providers
-│   └── test_graph.py             # 25 routing tests (unit + integration)
-├── infra/                        # Terraform – ECS Fargate + RDS + EFS
-│   ├── main.tf
-│   ├── variables.tf
-│   ├── networking.tf             # VPC, subnets, ALB, security groups
-│   ├── ecr.tf                    # ECR repository
-│   ├── efs.tf                    # EFS for ChromaDB persistence
-│   ├── rds.tf                    # RDS Postgres + SSM SecureString params
-│   ├── iam.tf                    # ECS roles + GitHub Actions OIDC role
-│   ├── ecs.tf                    # Fargate cluster, task definition, service
-│   ├── outputs.tf
-│   └── terraform.tfvars.example
-├── .github/workflows/deploy.yml  # CI/CD: build → ECR → ECS Fargate
-├── Dockerfile                    # Two-stage build (builder + runtime)
-├── .env                          # Local secrets (git-ignored)
-└── requirements.txt
+fantasy-novel-generator/
+├── backend/                      # FastAPI application
+│   ├── app/
+│   │   ├── agents/                # LangGraph pipeline (moved from src/agents/, logic unchanged)
+│   │   │   ├── state.py           # NovelState TypedDict
+│   │   │   ├── graph.py           # StateGraph, conditional routing, execute_graph()
+│   │   │   └── nodes/
+│   │   │       ├── world_and_creature.py
+│   │   │       ├── planning.py
+│   │   │       └── creature.py
+│   │   ├── db/
+│   │   │   ├── models.py          # SQLAlchemy 2.0 ORM models (Postgres)
+│   │   │   ├── init_db.py         # Schema bootstrap (idempotent, incl. pgvector extension)
+│   │   │   └── vector_store.py    # pgvector-backed lore store (replaces ChromaDB)
+│   │   ├── core/
+│   │   │   ├── config.py          # Env-driven settings
+│   │   │   └── auth.py            # Supabase JWT verification dependency
+│   │   ├── api/
+│   │   │   └── novels.py          # REST endpoints: list/detail/generate
+│   │   └── main.py                # FastAPI app, CORS, routing, startup
+│   ├── tests/
+│   │   └── test_api_auth.py       # Route wiring + auth-enforcement smoke tests
+│   ├── requirements.txt
+│   ├── Dockerfile
+│   └── .env.example
+├── frontend/                     # Next.js (App Router, TypeScript) application
+│   ├── app/
+│   │   ├── login/                 # Google sign-in via Supabase Auth
+│   │   ├── auth/callback/         # OAuth code exchange route
+│   │   ├── novels/                # Protected "My Novels" library page
+│   │   └── novels/[id]/           # Novel detail: chapters/characters/creatures
+│   ├── lib/
+│   │   ├── supabaseClient.ts      # Browser Supabase client
+│   │   ├── supabaseServer.ts      # Server Supabase client (cookies)
+│   │   └── api.ts                 # Typed fetch wrapper → backend API
+│   ├── middleware.ts              # Session refresh + route protection
+│   ├── package.json
+│   └── .env.local.example
+├── infra/
+│   └── legacy-aws-terraform/      # DEPRECATED — old ECS/RDS/EFS Terraform, kept for reference only
+├── docs/
+│   └── architecture-redesign.md   # Full migration proposal
+└── .github/workflows/
+    ├── backend.yml                # Install deps, pytest, Docker build
+    └── frontend.yml                # npm ci, lint, next build
 ```
 
 ---
 
-## Quickstart (local)
+## Migration status
+
+| Area | Status |
+|---|---|
+| Monorepo layout (`backend/`, `frontend/`) | ✅ Phase 1 |
+| FastAPI REST API (list/detail novels, sync generate) | ✅ Phase 1 |
+| Postgres models + `owner_id` scoping | ✅ Phase 1 |
+| pgvector lore store (replaces ChromaDB) | ✅ Phase 1 |
+| Supabase Auth (Google OAuth) + JWT verification | ✅ Phase 1 |
+| Next.js frontend (library + detail pages) | ✅ Phase 1 |
+| Streamlit UI | ❌ Removed in Phase 1 |
+| Async job queue (Upstash Redis + RQ) | ⏳ Phase 2 |
+| Markdown / PDF export (WeasyPrint) | ⏳ Phase 3 |
+| AWS Terraform (ECS/RDS/EFS) | ❌ Removed, see `infra/legacy-aws-terraform/` |
+
+---
+
+## Local Development
 
 ### Prerequisites
 
 - Python 3.11+
-- An OpenAI API key (or Anthropic / Google)
+- Node.js 20+
+- A [Supabase](https://supabase.com) project (free tier works) — or the
+  [Supabase CLI](https://supabase.com/docs/guides/cli) for a local stack
+  (`supabase start`)
+- An OpenAI API key
 
-### 1 — Clone and create a virtual environment
+### 1 — Backend (FastAPI)
 
 ```bash
-git clone https://github.com/your-org/fantansy-novel-generator.git
-cd fantansy-novel-generator
+cd backend
 python -m venv .venv
 # Windows
 .venv\Scripts\activate
 # macOS / Linux
 source .venv/bin/activate
-```
 
-### 2 — Install dependencies
-
-```bash
 pip install -r requirements.txt
-# OpenAI provider (default)
-pip install langchain-openai
-# Or Anthropic:  pip install langchain-anthropic
-# Or Google:     pip install langchain-google-genai
+cp .env.example .env
+# Fill in SUPABASE_URL, SUPABASE_JWT_SECRET, SUPABASE_SERVICE_ROLE_KEY,
+# DATABASE_URL (Postgres connection string from your Supabase project),
+# and OPENAI_API_KEY.
+
+uvicorn app.main:app --reload
 ```
 
-### 3 — Configure environment variables
+The backend starts on [http://localhost:8000](http://localhost:8000)
+(`/health` for a liveness check, `/docs` for the OpenAPI UI). On startup it
+creates the `vector` extension and any missing tables/columns.
 
-Copy `.env` and fill in your key (the file is already git-ignored):
+### 2 — Frontend (Next.js)
 
 ```bash
-# .env is already present – just open it and add your key
+cd frontend
+npm install
+cp .env.local.example .env.local
+# Fill in NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY,
+# NEXT_PUBLIC_API_URL (http://localhost:8000 for local dev).
+
+npm run dev
 ```
 
-Required variables (see `.env` for the full list):
+Open [http://localhost:3000](http://localhost:3000). In your Supabase
+project, enable the Google OAuth provider and add
+`http://localhost:3000/auth/callback` as a redirect URL.
 
-| Variable | Description |
-|---|---|
-| `OPENAI_API_KEY` | Your OpenAI API key |
-| `LLM_PROVIDER` | `openai` (default), `anthropic`, or `google` |
-| `LLM_MODEL` | Model name, e.g. `gpt-4o` |
-
-### 4 — Initialise the database
+### 3 — Running backend tests
 
 ```bash
-python -m src.db.init_db
+cd backend
+pip install pytest httpx
+pytest -v
 ```
 
-### 5 — Run the Streamlit app
-
-```bash
-streamlit run src/ui/app.py
-```
-
-Open [http://localhost:8501](http://localhost:8501) in your browser.
+Phase 1 ships route-wiring and auth-enforcement smoke tests only — no
+pre-existing test suite was found to migrate (the README previously
+referenced a `tests/` directory that did not exist in the repository).
+Tests run against a mocked JWT secret; no live Postgres/Supabase instance is
+required.
 
 ---
 
-## Running with Docker
+## Deployment
 
-```bash
-# Build
-docker build -t novelengine:latest .
+- **Frontend**: Vercel, connected via its own GitHub integration pointed at
+  the `frontend/` directory as the project root (automatic preview + prod
+  deploys — no custom GitHub Actions deploy step).
+- **Backend**: an always-on container on **Render** or **Fly.io** (not
+  Vercel serverless functions, since novel generation can take several
+  minutes per request — longer than typical serverless function limits).
+  `backend/Dockerfile` builds the image; `.github/workflows/backend.yml`
+  verifies it builds in CI.
+- **Database / Auth / Storage**: Supabase (hosted Postgres + pgvector +
+  Auth + Storage).
+- **Jobs** (Phase 2): Upstash Redis + RQ.
 
-# Run (mount a local data directory for SQLite + ChromaDB persistence)
-docker run -p 8501:8501 \
-  -v $(pwd)/data:/app/data \
-  --env-file .env \
-  novelengine:latest
-```
-
-The container initialises the database automatically before starting Streamlit.
-
----
-
-## Running Tests
-
-```bash
-pip install pytest
-pytest tests/ -v
-```
-
-Tests use `unittest.mock` stubs for all external services (chromadb, LangChain providers) — no API keys or running services required.
+Target budget: roughly $20–50/month overall (Supabase free/pro tier, a small
+Render/Fly.io instance, Vercel free tier, Upstash free tier).
 
 ---
 
 ## Environment Variables
 
-| Variable | Default | Description |
-|---|---|---|
-| `OPENAI_API_KEY` | — | API key for OpenAI (required when `LLM_PROVIDER=openai`) |
-| `ANTHROPIC_API_KEY` | — | API key for Anthropic |
-| `GOOGLE_API_KEY` | — | API key for Google |
-| `LLM_PROVIDER` | `openai` | Active LLM provider |
-| `LLM_MODEL` | `gpt-4o` | Model name passed to LangChain |
-| `LLM_TEMPERATURE` | `0.85` | Generation temperature |
-| `MAX_REVISION_LOOPS` | `5` | Max scene-writer / red-team cycles before forced exit |
-| `DATABASE_URL` | `sqlite:///./novelengine.db` | SQLAlchemy connection string |
-| `CHROMA_PATH` | `./chroma_db` | Directory for ChromaDB persistence |
+### `backend/.env`
 
----
+| Variable | Description |
+|---|---|
+| `SUPABASE_URL` | Your Supabase project URL |
+| `SUPABASE_SERVICE_ROLE_KEY` | Supabase service-role key (server-side only, never exposed to the frontend) |
+| `SUPABASE_JWT_SECRET` | Shared secret used to verify Supabase Auth JWTs |
+| `DATABASE_URL` | Postgres connection string (Supabase connection pooler recommended) |
+| `OPENAI_API_KEY` | API key for OpenAI |
+| `LLM_MODEL` | Model name passed to LangChain, e.g. `gpt-4o` |
+| `LLM_TEMPERATURE` | Generation temperature |
+| `MAX_REVISION_LOOPS` | Max scene-writer / red-team cycles before forced exit |
+| `CORS_ORIGINS` | Comma-separated list of allowed frontend origins |
 
-## Cloud Deployment (AWS ECS Fargate)
+### `frontend/.env.local`
 
-Full Terraform configuration lives in `infra/`. It provisions:
-
-- **VPC** with public (ALB) and private (ECS + RDS) subnets across 2 AZs
-- **ECR** repository with scan-on-push and lifecycle policy
-- **EFS** file system for ChromaDB persistence across task restarts
-- **RDS Postgres 16** (replaces SQLite in production)
-- **ECS Fargate** cluster + service + task definition
-- **ALB** exposing port 8501
-- **IAM** roles for ECS execution, the task, and a GitHub Actions OIDC role (no static credentials)
-
-### Bootstrap (one-time)
-
-```bash
-cd infra
-cp terraform.tfvars.example terraform.tfvars
-# Edit terraform.tfvars: set github_repo, llm_api_key, db_password
-
-terraform init
-terraform apply
-```
-
-Copy the `github_actions_role_arn` output value and add it as the `AWS_ROLE_ARN` secret in your GitHub repository. Subsequent pushes to `main` trigger automatic deploys via `.github/workflows/deploy.yml`.
+| Variable | Description |
+|---|---|
+| `NEXT_PUBLIC_SUPABASE_URL` | Your Supabase project URL |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase anon/public key |
+| `NEXT_PUBLIC_API_URL` | Base URL of the FastAPI backend |
 
 ---
 
@@ -207,12 +234,12 @@ Copy the `github_actions_role_arn` output value and add it as the `AWS_ROLE_ARN`
 
 | Agent | Node | Responsibility |
 |---|---|---|
-| World Architect | `world_architect` | Generates geography, kingdoms, and magic systems; persists to ChromaDB |
+| World Architect | `world_architect` | Generates geography, kingdoms, and magic systems; persists lore to pgvector |
 | Creature Architect | `creature_architect` | Creates mythical beasts with ecology and magical traits linked to world lore |
 | Character Agent | `character_agent` | Builds character dossiers (backstory, motivation, fatal flaw, arc) |
 | Plot Agent | `plot_agent` | Produces multi-POV chapter outlines with scene beats |
-| Scene Writer | `scene_writer` | Writes chapter prose from the beat outline *(stub — Story 3.4)* |
-| Red Team Auditor | `red_team` | Critiques the draft against lore; returns a 1-10 score *(stub — Story 3.5)* |
-| Prose Stylist | `prose_stylist` | Final prose polish pass before output *(stub)* |
+| Scene Writer | `scene_writer` | Writes chapter prose from the beat outline |
+| Red Team Auditor | `red_team` | Critiques the draft against lore; returns a 1-10 score |
+| Prose Stylist | `prose_stylist` | Final prose polish pass before output |
 
 Routing rule: if `feedback_score < 8` **and** `revision_count < MAX_REVISION_LOOPS`, the graph loops back to Scene Writer. Otherwise it exits to Prose Stylist.
