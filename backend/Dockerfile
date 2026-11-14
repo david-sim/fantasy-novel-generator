@@ -4,11 +4,17 @@ FROM python:3.11-slim AS builder
 
 WORKDIR /build
 
-# Install system build dependencies needed by psycopg / pydantic
+# Install system build dependencies needed by psycopg / pydantic, plus the
+# Pango/Cairo headers WeasyPrint's cffi bindings need to build (Phase 3 PDF
+# export).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         gcc \
         libpq-dev \
+        libpango-1.0-0 \
+        libpangocairo-1.0-0 \
+        libcairo2-dev \
+        libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -26,9 +32,20 @@ RUN groupadd --gid 1001 novelengine \
 
 WORKDIR /app
 
-# Runtime dependency for psycopg (built against it in the builder stage)
+# Runtime dependency for psycopg (built against it in the builder stage),
+# plus the shared libraries WeasyPrint needs at runtime to render PDFs
+# (Phase 3 export): Pango/Cairo/GDK-Pixbuf for layout + rasterization,
+# shared-mime-info for MIME detection, and DejaVu as a default font so PDF
+# text doesn't fall back to tofu boxes in a minimal container.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libpq5 \
+        libpango-1.0-0 \
+        libpangocairo-1.0-0 \
+        libcairo2 \
+        libgdk-pixbuf2.0-0 \
+        libffi8 \
+        shared-mime-info \
+        fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy pre-built packages from builder stage

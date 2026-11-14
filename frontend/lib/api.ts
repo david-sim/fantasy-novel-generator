@@ -4,6 +4,7 @@ export interface NovelSummary {
   genre?: string | null;
   tone?: string | null;
   synopsis?: string | null;
+  chapter_count: number;
 }
 
 export interface ChapterOut {
@@ -128,4 +129,49 @@ export function getJobStatus(
   accessToken: string
 ): Promise<JobStatus> {
   return apiFetch<JobStatus>(`/api/novels/${novelId}/jobs/${jobId}`, accessToken);
+}
+
+export type ExportFormat = "markdown" | "pdf";
+
+/**
+ * Download a novel export (Markdown or PDF, Phase 3).
+ *
+ * Fetches the export endpoint with the bearer token attached (a plain
+ * `<a href>` can't carry an Authorization header), then triggers a
+ * client-side blob download using the filename the API suggested via
+ * `Content-Disposition`.
+ */
+export async function downloadNovelExport(
+  novelId: number,
+  format: ExportFormat,
+  accessToken: string
+): Promise<void> {
+  const res = await fetch(`${API_URL}/api/novels/${novelId}/export?format=${format}`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const body = await res.json();
+      if (body?.detail) detail = body.detail;
+    } catch {
+      // response body wasn't JSON — fall back to the status text above
+    }
+    throw new Error(detail);
+  }
+
+  const disposition = res.headers.get("content-disposition") ?? "";
+  const match = disposition.match(/filename="?([^"]+)"?/);
+  const filename = match?.[1] ?? `novel.${format === "markdown" ? "md" : "pdf"}`;
+
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
 }

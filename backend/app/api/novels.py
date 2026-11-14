@@ -12,13 +12,19 @@ import logging
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.auth import get_current_user_id
 from app.core.queue import get_queue
 from app.db.models import AgentLog, Chapter, Character, Creature, GenerationJob, Novel, engine
+from app.services.export import (
+    export_filename_stem,
+    has_exportable_content,
+    render_markdown,
+    render_pdf,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +50,7 @@ class NovelSummary(BaseModel):
     genre: Optional[str] = None
     tone: Optional[str] = None
     synopsis: Optional[str] = None
+    chapter_count: int = 0
 
     model_config = {"from_attributes": True}
 
@@ -123,17 +130,27 @@ def _get_owned_novel(session: Session, novel_id: int, owner_id: str) -> Novel:
 
 
 @router.get("", response_model=list[NovelSummary])
-def list_novels(owner_id: str = Depends(get_current_user_id)) -> list[Novel]:
-    """List every novel owned by the authenticated user."""
+def list_novels(owner_id: str = Depends(get_current_user_id)) -> list[NovelSummary]:
+    """List every novel owned by the authenticated user, with its chapter count."""
     with Session(engine) as session:
         novels = (
             session.query(Novel)
+            .options(selectinload(Novel.chapters))
             .filter(Novel.owner_id == owner_id)
             .order_by(Novel.created_at.desc())
             .all()
         )
-        session.expunge_all()
-        return novels
+        return [
+            NovelSummary(
+                id=novel.id,
+                title=novel.title,
+                genre=novel.genre,
+                tone=novel.tone,
+                synopsis=novel.synopsis,
+                chapter_count=len(novel.chapters),
+            )
+            for novel in novels
+        ]
 
 
 @router.post("", response_model=NovelSummary, status_code=status.HTTP_201_CREATED)
@@ -249,4 +266,71 @@ def get_job_status(
             latest_log=(
                 (latest_log.error_message or latest_log.output_summary) if latest_log else None
             ),
+        )
+
+
+@router.get("/{novel_id}/export")
+def export_novel(
+    novel_id: int,
+    format: str,  # noqa: A002 - "format" is the clearest query param name here
+    owner_id: str = Depends(get_current_user_id),
+) -> Response:
+    """
+    Export a completed novel as a downloadable Markdown or PDF document.
+
+    Phase 3: reuses the Phase 1 owner-only authorization dependency and the
+    same content structure (title, ordered chapters, character/creature lore
+    appendix) for both formats — Markdown is serialized directly, PDF is
+    rendered via Jinja2 -> WeasyPrint from the same data.
+    """
+    if format not in ("markdown", "pdf"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported export format. Use 'markdown' or 'pdf'.",
+        )
+
+    with Session(engine) as session:
+        novel = (
+            session.query(Novel)
+            .options(
+                selectinload(Novel.chapters),
+                selectinload(Novel.characters),
+                selectinload(Novel.creatures),
+            )
+            .filter(Novel.id == novel_id)
+            .first()
+        )
+        if novel is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Novel not found.")
+        if novel.owner_id != owner_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your novel.")
+
+        if not has_exportable_content(novel):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "This novel has no completed chapters yet. Generate it "
+                    "before exporting."
+                ),
+            )
+
+        filename_stem = export_filename_stem(novel)
+
+        if format == "markdown":
+            body = render_markdown(novel)
+            return Response(
+                content=body,
+                media_type="text/markdown",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename_stem}.md"'
+                },
+            )
+
+        pdf_bytes = render_pdf(novel)
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename_stem}.pdf"'
+            },
         )
