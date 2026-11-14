@@ -31,10 +31,10 @@ app = FastAPI(
     title="NovelEngine API",
     description=(
         "REST API wrapping the NovelEngine LangGraph pipeline. "
-        "Phase 1 scaffold: the /generate endpoint is synchronous for now "
-        "and will become an async queued job (Upstash Redis + RQ) in Phase 2."
+        "Phase 2: /generate enqueues an async Redis + RQ job and returns a "
+        "job id immediately; poll /api/novels/{id}/jobs/{job_id} for progress."
     ),
-    version="0.1.0",
+    version="0.2.0",
 )
 
 app.add_middleware(

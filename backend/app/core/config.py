@@ -26,6 +26,10 @@ class Settings:
     # Database (same DSN used by app.db.models)
     database_url: str = os.getenv("DATABASE_URL", "")
 
+    # Async job queue (Phase 2) — any Redis-compatible endpoint, including
+    # Upstash's Redis-compatible TCP endpoint.
+    redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
     # LLM
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
 

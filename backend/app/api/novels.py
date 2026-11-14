@@ -9,15 +9,16 @@ ever see or act on their own novels.
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session, selectinload
 
-from app.agents.graph import execute_graph
 from app.core.auth import get_current_user_id
-from app.db.models import Chapter, Character, Creature, Novel, engine
+from app.core.queue import get_queue
+from app.db.models import AgentLog, Chapter, Character, Creature, GenerationJob, Novel, engine
 
 logger = logging.getLogger(__name__)
 
@@ -87,9 +88,19 @@ class GenerateRequest(BaseModel):
 
 
 class GenerateResponse(BaseModel):
+    job_id: str
+    status: str
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
     novel_id: int
-    chapter_count: int
-    feedback_score: int
+    status: str
+    error_message: Optional[str] = None
+    chapter_count: Optional[int] = None
+    feedback_score: Optional[int] = None
+    current_agent: Optional[str] = None
+    latest_log: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -164,35 +175,78 @@ def get_novel(
         return novel
 
 
-@router.post("/{novel_id}/generate", response_model=GenerateResponse)
+@router.post(
+    "/{novel_id}/generate",
+    response_model=GenerateResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 async def generate_novel(
     novel_id: int,
     payload: GenerateRequest,
     owner_id: str = Depends(get_current_user_id),
 ) -> GenerateResponse:
     """
-    Run the LangGraph generation pipeline for this novel and return once done.
+    Enqueue an async LangGraph generation job for this novel and return
+    immediately with a job id.
 
-    NOTE (Phase 1 -> Phase 2): this call is synchronous and will block the
-    request for the full multi-minute duration of a generation run. In
-    Phase 2 this will be replaced with an endpoint that enqueues an
-    Upstash Redis + RQ background job and returns immediately with a job id,
-    polled by the frontend. The call to ``execute_graph`` itself is expected
-    to carry over unchanged into the worker.
+    Phase 2: generation now runs in a separate ``rq worker`` process (see
+    ``app.worker``) instead of blocking this request for the full
+    multi-minute run. Poll ``GET /{novel_id}/jobs/{job_id}`` for progress and
+    the final result.
     """
     with Session(engine) as session:
         _get_owned_novel(session, novel_id, owner_id)
 
-    logger.info("[generate_novel] starting synchronous run for novel_id=%s", novel_id)
-    final_state = await execute_graph(novel_id=novel_id, initial_prompt=payload.initial_prompt)
-
+    job_id = str(uuid.uuid4())
     with Session(engine) as session:
-        chapter_count = (
-            session.query(Chapter).filter(Chapter.novel_id == novel_id).count()
+        with session.begin():
+            session.add(GenerationJob(id=job_id, novel_id=novel_id, status="queued"))
+
+    get_queue().enqueue(
+        "app.worker.run_generation_job",
+        novel_id=novel_id,
+        initial_prompt=payload.initial_prompt,
+        job_id=job_id,
+        job_timeout="20m",
+    )
+
+    logger.info(
+        "[generate_novel] enqueued job_id=%s for novel_id=%s", job_id, novel_id
+    )
+
+    return GenerateResponse(job_id=job_id, status="queued")
+
+
+@router.get("/{novel_id}/jobs/{job_id}", response_model=JobStatusResponse)
+def get_job_status(
+    novel_id: int,
+    job_id: str,
+    owner_id: str = Depends(get_current_user_id),
+) -> JobStatusResponse:
+    """Return the current status/progress of a previously enqueued generation job."""
+    with Session(engine) as session:
+        _get_owned_novel(session, novel_id, owner_id)
+
+        job = session.get(GenerationJob, job_id)
+        if job is None or job.novel_id != novel_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
+
+        latest_log = (
+            session.query(AgentLog)
+            .filter(AgentLog.novel_id == novel_id)
+            .order_by(AgentLog.run_at.desc())
+            .first()
         )
 
-    return GenerateResponse(
-        novel_id=novel_id,
-        chapter_count=chapter_count,
-        feedback_score=final_state.get("feedback_score", 0),
-    )
+        return JobStatusResponse(
+            job_id=job.id,
+            novel_id=job.novel_id,
+            status=job.status,
+            error_message=job.error_message,
+            chapter_count=job.chapter_count,
+            feedback_score=job.feedback_score,
+            current_agent=latest_log.agent_name if latest_log else None,
+            latest_log=(
+                (latest_log.error_message or latest_log.output_summary) if latest_log else None
+            ),
+        )

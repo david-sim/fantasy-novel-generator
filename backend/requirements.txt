@@ -29,3 +29,8 @@ pydantic-settings>=2.0.0
 
 # Optional: Supabase server-side client (service role operations)
 supabase>=2.4.0
+
+# Async job queue (Phase 2) — works against any Redis-compatible endpoint,
+# including Upstash's Redis-compatible TCP endpoint, configured via REDIS_URL.
+redis>=5.0.0
+rq>=1.16.0
