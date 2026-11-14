@@ -4,15 +4,14 @@ A multi-agent generative AI system that autonomously writes publication-grade
 fantasy novels. Powered by **LangGraph** for agent orchestration and
 **LangChain** for LLM calls.
 
-> **Architecture migration in progress.** This repo is moving from a
+> **Architecture migration complete.** This repo has moved from a
 > single-container Streamlit + SQLite + ChromaDB app to a monorepo of a
 > **FastAPI backend** + **Next.js frontend** on **Supabase** (Postgres +
 > pgvector + Auth + Storage). The full proposal is tracked in
-> `docs/architecture-redesign.md` (see PR #3 — docs-only, not yet merged).
-> This document describes the **new** architecture as of **Phase 2** of that
-> migration (scaffold, auth, persistence, async job pipeline). Phase 3
-> (export + polish) lands in a follow-up PR — see
-> [Migration status](#migration-status) below.
+> `docs/architecture-redesign.md` (see PR #3 — docs-only). This document
+> describes the architecture as of **Phase 3** of that migration (export +
+> polish, the final layer — see [Migration status](#migration-status)
+> below).
 
 ---
 
@@ -33,22 +32,26 @@ fantasy novels. Powered by **LangGraph** for agent orchestration and
 │                                Supabase                                    │
 │  Auth (Google OAuth)   │   Postgres (Novel/Chapter/Character/Creature)     │
 │                        │   pgvector (lore embeddings, replaces ChromaDB)   │
-│                        │   Storage (future: generated exports)            │
+│                        │   Storage (unused — exports stream directly)      │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
 The LangGraph agent pipeline itself is **unchanged** by this migration — only
-how it's invoked (FastAPI instead of Streamlit callbacks) and where it
-persists data (Postgres/pgvector via Supabase instead of SQLite/ChromaDB)
-have changed.
+how it's invoked (FastAPI instead of Streamlit callbacks), where it persists
+data (Postgres/pgvector via Supabase instead of SQLite/ChromaDB), and how
+results are retrieved (async job polling, Markdown/PDF export) have changed.
 
 **Phase 1:** the `/api/novels/{id}/generate` endpoint called `execute_graph()`
 **synchronously** — the HTTP request blocked until generation finished.
-**Phase 2 (this PR):** `/generate` enqueues an async job on a Redis queue
+**Phase 2:** `/generate` enqueues an async job on a Redis queue
 (RQ) and returns a `job_id` immediately (`202 Accepted`); a separate
 **worker** process pulls jobs off the queue and runs `execute_graph()`. The
 frontend polls `GET /api/novels/{id}/jobs/{job_id}` on a simple interval
 (no websockets/SSE) to show live progress and the final result.
+**Phase 3 (this PR):** once a novel has completed chapters, it can be
+exported as a single Markdown document or a PDF (rendered via WeasyPrint)
+from the novel detail page, and the frontend got a lightweight polish pass
+(library/detail page layout, empty/loading states, basic responsive tweaks).
 
 ---
 
@@ -73,12 +76,17 @@ fantasy-novel-generator/
 │   │   │   ├── config.py          # Env-driven settings
 │   │   │   ├── auth.py            # Supabase JWT verification dependency
 │   │   │   └── queue.py           # Shared Redis connection + RQ queue accessor
+│   │   ├── services/
+│   │   │   └── export.py          # Markdown/PDF export rendering (Phase 3, shared by both formats)
+│   │   ├── templates/
+│   │   │   └── novel_export.html  # Jinja2 template used as WeasyPrint's HTML input
 │   │   ├── api/
-│   │   │   └── novels.py          # REST endpoints: list/detail/generate/job-status
+│   │   │   └── novels.py          # REST endpoints: list/detail/generate/job-status/export
 │   │   ├── worker.py               # RQ worker entrypoint (Phase 2 async jobs)
 │   │   └── main.py                # FastAPI app, CORS, routing, startup
 │   ├── tests/
-│   │   └── test_api_auth.py       # Route wiring + auth-enforcement smoke tests
+│   │   ├── test_api_auth.py       # Route wiring + auth-enforcement smoke tests
+│   │   └── test_export.py         # Export endpoint: auth, no-content error, markdown/pdf content-types
 │   ├── requirements.txt
 │   ├── Dockerfile
 │   └── .env.example
@@ -87,7 +95,8 @@ fantasy-novel-generator/
 │   │   ├── login/                 # Google sign-in via Supabase Auth
 │   │   ├── auth/callback/         # OAuth code exchange route
 │   │   ├── novels/                # Protected "My Novels" library page
-│   │   └── novels/[id]/           # Novel detail + GenerationPanel (trigger/poll jobs)
+│   │   └── novels/[id]/           # Novel detail: chapters/characters/creatures,
+│   │                              # GenerationPanel (trigger/poll jobs), ExportButtons
 │   ├── lib/
 │   │   ├── supabaseClient.ts      # Browser Supabase client
 │   │   ├── supabaseServer.ts      # Server Supabase client (cookies)
@@ -119,7 +128,8 @@ fantasy-novel-generator/
 | Next.js frontend (library + detail pages) | ✅ Phase 1 |
 | Streamlit UI | ❌ Removed in Phase 1 |
 | Async job queue (Redis + RQ) + polling UI | ✅ Phase 2 |
-| Markdown / PDF export (WeasyPrint) | ⏳ Phase 3 |
+| Markdown / PDF export (WeasyPrint) | ✅ Phase 3 |
+| Frontend polish (library/detail layout, empty & loading states) | ✅ Phase 3 |
 | AWS Terraform (ECS/RDS/EFS) | ❌ Removed, see `infra/legacy-aws-terraform/` |
 
 ---
@@ -202,7 +212,33 @@ Open [http://localhost:3000](http://localhost:3000). In your Supabase
 project, enable the Google OAuth provider and add
 `http://localhost:3000/auth/callback` as a redirect URL.
 
-### 4 — Running backend tests
+### 4 — Export (Phase 3: Markdown / PDF)
+
+`GET /api/novels/{id}/export?format=markdown` and
+`GET /api/novels/{id}/export?format=pdf` return a completed novel (title,
+ordered chapters, character/creature appendix) as a downloadable file — a
+clickable button on the novel detail page, or directly:
+
+```bash
+curl -H "Authorization: Bearer <supabase-access-token>" \
+  "http://localhost:8000/api/novels/1/export?format=markdown" -o novel.md
+```
+
+PDF export renders the same content to HTML (Jinja2 template in
+`backend/app/templates/novel_export.html`) and converts it with
+[WeasyPrint](https://doc.courtbouillon.org/weasyprint/stable/), which needs
+system-level Pango/Cairo libraries. `backend/Dockerfile`'s runtime stage
+installs them so PDF export works in the deployed container; for **local,
+non-Docker** development on Linux, install your distro's WeasyPrint
+dependencies ([install guide](https://doc.courtbouillon.org/weasyprint/stable/first_steps.html#installation));
+on Windows, install the [GTK3 runtime](https://github.com/tschoonj/GTK-for-Windows-Runtime-Environment-Installer/releases).
+No new environment variables are required for export.
+
+Both endpoints enforce the same owner-only authorization as every other
+`/api/novels` route, and return `409 Conflict` if the novel has no completed
+chapters yet.
+
+### 5 — Running backend tests
 
 ```bash
 cd backend
@@ -210,10 +246,15 @@ pip install pytest httpx
 pytest -v
 ```
 
-Phase 1 shipped route-wiring and auth-enforcement smoke tests. Phase 2 adds
-one for the new job-status route, plus a CI step that import-smoke-tests
-`app.worker`. Tests run against a mocked JWT secret; no live Postgres/Redis
-instance is required.
+Phase 1 shipped route-wiring and auth-enforcement smoke tests. Phase 2 added
+one for the job-status route, plus a CI step that import-smoke-tests
+`app.worker`. Phase 3 adds `tests/test_export.py` (auth enforcement, the
+no-completed-chapters error, and markdown/pdf content-type checks) —
+WeasyPrint's own PDF rendering is stubbed in these tests so they don't need
+its native libraries installed locally; CI installs them (see
+`.github/workflows/backend.yml`) so the Docker build stage still gets full
+coverage of the real dependency chain. Tests run against a mocked JWT
+secret; no live Postgres/Redis instance is required.
 
 ---
 

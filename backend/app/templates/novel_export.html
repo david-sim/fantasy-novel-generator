@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{ novel.title }}</title>
+<style>
+    @page {
+        margin: 2.5cm 2cm;
+        @bottom-center { content: counter(page); font-size: 9pt; color: #666; }
+    }
+    body {
+        font-family: Georgia, "Times New Roman", serif;
+        color: #1a1a1a;
+        line-height: 1.5;
+    }
+    h1.title {
+        font-size: 28pt;
+        text-align: center;
+        margin-bottom: 0.2em;
+    }
+    p.subtitle {
+        text-align: center;
+        color: #555;
+        margin-top: 0;
+        margin-bottom: 2em;
+    }
+    h2.chapter-heading {
+        font-size: 18pt;
+        border-bottom: 1px solid #ccc;
+        padding-bottom: 0.2em;
+        margin-top: 2em;
+        page-break-before: always;
+    }
+    .chapter-body {
+        white-space: pre-wrap;
+        font-size: 11pt;
+    }
+    h2.appendix-heading {
+        font-size: 16pt;
+        margin-top: 2em;
+        page-break-before: always;
+    }
+    .entry {
+        margin-bottom: 1.2em;
+    }
+    .entry-name {
+        font-weight: bold;
+        font-size: 12pt;
+    }
+    .entry-role {
+        color: #555;
+        font-style: italic;
+    }
+</style>
+</head>
+<body>
+    <h1 class="title">{{ novel.title }}</h1>
+    {% if novel.genre or novel.tone %}
+    <p class="subtitle">
+        {{ [novel.genre, novel.tone] | select | join(" \u2014 ") }}
+    </p>
+    {% endif %}
+    {% if novel.synopsis %}
+    <p class="subtitle">{{ novel.synopsis }}</p>
+    {% endif %}
+
+    {% for chapter in chapters %}
+    <h2 class="chapter-heading">
+        Chapter {{ chapter.chapter_number }}{% if chapter.title %}: {{ chapter.title }}{% endif %}
+    </h2>
+    <div class="chapter-body">{{ chapter.content or "" }}</div>
+    {% endfor %}
+
+    {% if characters %}
+    <h2 class="appendix-heading">Characters</h2>
+    {% for character in characters %}
+    <div class="entry">
+        <p class="entry-name">{{ character.name }}{% if character.role %}<span class="entry-role"> &mdash; {{ character.role }}</span>{% endif %}</p>
+        {% if character.backstory %}<p>{{ character.backstory }}</p>{% endif %}
+    </div>
+    {% endfor %}
+    {% endif %}
+
+    {% if creatures %}
+    <h2 class="appendix-heading">Creatures</h2>
+    {% for creature in creatures %}
+    <div class="entry">
+        <p class="entry-name">{{ creature.name }}{% if creature.species_type %}<span class="entry-role"> &mdash; {{ creature.species_type }}</span>{% endif %}</p>
+        {% if creature.lore_description %}<p>{{ creature.lore_description }}</p>{% endif %}
+    </div>
+    {% endfor %}
+    {% endif %}
+</body>
+</html>

@@ -32,6 +32,16 @@ jobs:
           cache: "pip"
           cache-dependency-path: backend/requirements.txt
 
+      # WeasyPrint (Phase 3 PDF export) needs Pango/Cairo at import time —
+      # install the same apt packages the backend Dockerfile's runtime
+      # stage installs so `pytest` can actually render a PDF in CI.
+      - name: Install WeasyPrint system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libpango-1.0-0 libpangocairo-1.0-0 libcairo2 \
+            libgdk-pixbuf2.0-0 libffi-dev shared-mime-info fonts-dejavu-core
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip

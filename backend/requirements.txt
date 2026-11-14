@@ -34,3 +34,10 @@ supabase>=2.4.0
 # including Upstash's Redis-compatible TCP endpoint, configured via REDIS_URL.
 redis>=5.0.0
 rq>=1.16.0
+
+# Export (Phase 3) — Markdown export is plain string formatting (no extra
+# dependency); PDF export renders an HTML template with Jinja2 and converts
+# it to PDF with WeasyPrint. WeasyPrint needs system-level Pango/Cairo libs
+# at runtime — see backend/Dockerfile for the required apt packages.
+jinja2>=3.1.0
+weasyprint>=62.0
